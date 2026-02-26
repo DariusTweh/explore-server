@@ -391,6 +391,9 @@ function parseSpotLocation(message) {
 function inferSpotTypes(message, { defaultType = null } = {}) {
   const text = (message || "").toLowerCase();
   const types = new Set();
+  if (text.includes("things to do") || text.includes("what to do")) {
+    types.add("tourist_attraction");
+  }
   if (text.includes("cafe") || text.includes("cafes") || text.includes("coffee")) types.add("cafe");
   if (text.includes("library")) types.add("library");
   if (text.includes("gym")) types.add("gym");
@@ -746,7 +749,27 @@ async function handlePlacesIntent({
     results = await placesNearbySearchNew(body, fieldMask);
   }
 
-  const cards = normalizePlacesNearby(results?.places).slice(0, 6);
+  let cards = normalizePlacesNearby(results?.places).slice(0, 6);
+  if (!cards.length && !isRestaurantIntent) {
+    try {
+      const fallbackBody = {
+        locationRestriction: {
+          circle: {
+            center: { latitude: resolved.lat, longitude: resolved.lng },
+            radius,
+          },
+        },
+        includedTypes: ["tourist_attraction", "museum", "park"],
+        maxResultCount: 12,
+        rankPreference: "POPULARITY",
+      };
+      const fallback = await placesNearbySearchNew(fallbackBody, fieldMask);
+      cards = normalizePlacesNearby(fallback?.places).slice(0, 6);
+      if (cards.length) searchMode = "nearby_fallback";
+    } catch {
+      // no-op
+    }
+  }
   const markers = buildSpotMarkers(cards);
   const keyword = q || typeHints.join(" ") || (isRestaurantIntent ? "restaurants" : "spots");
 

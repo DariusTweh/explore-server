@@ -1201,7 +1201,10 @@ function getDepartureTimeWindowOk(departureAt, timeWindow) {
 }
 
 function parseDurationSec(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value > 2_000_000) return Math.round(value / 1000);
+    return value;
+  }
   if (typeof value !== "string") return null;
   const text = value.trim();
   if (!text) return null;
@@ -1213,7 +1216,9 @@ function parseDurationSec(value) {
     return hours * 3600 + mins * 60 + secs;
   }
   const plain = Number(text);
-  return Number.isFinite(plain) ? plain : null;
+  if (!Number.isFinite(plain)) return null;
+  if (plain > 2_000_000) return Math.round(plain / 1000);
+  return plain;
 }
 
 function diffSecondsFromTimes(departAt, arriveAt) {
@@ -2673,7 +2678,11 @@ export async function assistantRoutes(app) {
         offer?.segments?.[0]?.legs?.[0]?.carriersData?.[0]?.logo ||
         offer?.carriers?.[0]?.logo ||
         null;
+      const allLegs = segments.flatMap((segment) =>
+        Array.isArray(segment?.legs) ? segment.legs : []
+      );
       const priceObj =
+        offer?.priceBreakdown?.total ||
         offer?.price?.total ||
         offer?.price?.grandTotal ||
         offer?.price?.amount ||
@@ -2681,21 +2690,36 @@ export async function assistantRoutes(app) {
         offer?.total;
       const departAt = firstSegment?.departure?.at || firstSegment?.departureTime || null;
       const arriveAt = lastSegment?.arrival?.at || lastSegment?.arrivalTime || null;
+      const segmentDurationSum = segments
+        .map((segment) => parseDurationSec(segment?.totalTime) || parseDurationSec(segment?.duration))
+        .filter((value) => Number.isFinite(value))
+        .reduce((sum, value) => sum + value, 0);
+      const legDurationSum = allLegs
+        .map((leg) => parseDurationSec(leg?.totalTime) || parseDurationSec(leg?.duration))
+        .filter((value) => Number.isFinite(value))
+        .reduce((sum, value) => sum + value, 0);
       const durationSec =
+        parseDurationSec(offer?.totalTime) ||
         parseDurationSec(offer?.duration) ||
         parseDurationSec(firstSegment?.duration) ||
+        (segmentDurationSum > 0 ? segmentDurationSum : null) ||
+        (legDurationSum > 0 ? legDurationSum : null) ||
         parseDurationSec(offer?.totalDuration) ||
         diffSecondsFromTimes(departAt, arriveAt);
       const price = moneyToNumber(priceObj) || moneyToNumber(offer?.price);
 
       return {
         providerId: offer?.token || offer?.id || `${fromLoc.id}-${toLoc.id}-${index}`,
+        token: offer?.token || offer?.id || null,
         from: fromLoc.code || fromLoc.label,
         to: toLoc.code || toLoc.label,
         departAt,
         arriveAt,
         durationSec,
-        stops: Math.max(segments.length - 1, 0),
+        stops:
+          typeof offer?.stops === "number"
+            ? offer.stops
+            : Math.max((allLegs.length || 1) - 1, 0),
         price,
         currency:
           priceObj?.currencyCode ||

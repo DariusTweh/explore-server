@@ -17,5 +17,8 @@
     "node": "^25.5.0",
     "openai": "^6.16.0",
     "zod": "^4.3.5"
+  },
+  "devDependencies": {
+    "@expo/ngrok": "^4.1.3"
   }
 }

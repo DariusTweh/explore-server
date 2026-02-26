@@ -9,6 +9,7 @@ import { hotelsRoutes } from "./routes/hotels.js";
 import { hotelDetailsRoutes } from "./routes/hotelDetails.js";
 import { attractionsRoutes } from "./routes/attractions.js";
 import { placesRoutes } from "./routes/places.js";
+import { exploreRoutes } from "./routes/explore.js";
 
 const app = Fastify({ logger: true });
 
@@ -20,6 +21,7 @@ await app.register(hotelsRoutes, { prefix: "/api/hotels" });
 await app.register(hotelDetailsRoutes, { prefix: "/api/hotels" });
 await app.register(attractionsRoutes, { prefix: "/api/attractions" });
 await app.register(placesRoutes, { prefix: "/api/places" });
+await app.register(exploreRoutes, { prefix: "/api/explore" });
 await app.register(tripsRoutes, { prefix: "/api/trips" });
 await app.register(assistantRoutes, { prefix: "/api/assistant" });
 app.get("/ping", async () => "pong");

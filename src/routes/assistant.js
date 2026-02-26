@@ -172,6 +172,24 @@ function messageMentionsActivities(message) {
   return ACTIVITY_KEYWORDS.some((kw) => text.includes(kw));
 }
 
+function messageWantsBookableActivities(message) {
+  const text = (message || "").toLowerCase();
+  const bookingSignals = [
+    "book",
+    "booking",
+    "ticket",
+    "tickets",
+    "reserve",
+    "reservation",
+    "availability",
+    "skip the line",
+    "skip-the-line",
+    "price",
+    "cost",
+  ];
+  return bookingSignals.some((kw) => text.includes(kw));
+}
+
 function messageMentionsSpots(message) {
   const text = (message || "").toLowerCase();
   const hasKeyword = SPOT_KEYWORDS.some((kw) => text.includes(kw));
@@ -599,7 +617,9 @@ async function handlePlacesIntent({
   modifiersOverride,
   clientLat,
   clientLng,
+  logger,
 }) {
+  const startedAt = Date.now();
   const modifiers = modifiersOverride || extractSpotModifiers(message);
   const typeHints = inferSpotTypes(message, {
     defaultType: isRestaurantIntent ? "restaurant" : "cafe",
@@ -730,7 +750,7 @@ async function handlePlacesIntent({
   const markers = buildSpotMarkers(cards);
   const keyword = q || typeHints.join(" ") || (isRestaurantIntent ? "restaurants" : "spots");
 
-  return {
+  const payload = {
     assistantMessage: cards.length
       ? `Here are some ${isRestaurantIntent ? "restaurants" : "spots"} in ${resolved.label || locationText}.`
       : `I couldn't find ${isRestaurantIntent ? "restaurants" : "spots"} in ${resolved.label || locationText} right now.`,
@@ -780,6 +800,18 @@ async function handlePlacesIntent({
     },
     tripId: resolvedTripId,
   };
+  logger?.info?.(
+    {
+      ms: Date.now() - startedAt,
+      mode: searchMode,
+      results: cards.length,
+      nearMe,
+      locationText: locationText || null,
+      query: q || null,
+    },
+    "[assistant] places_intent"
+  );
+  return payload;
 }
 
 function getTimeWindow(message) {
@@ -891,6 +923,48 @@ function parseDateRangeFromText(text) {
   }
 
   return null;
+}
+
+function normalizeCreateTripPrefs(input) {
+  const prefs = input && typeof input === "object" ? input : null;
+  if (!prefs) return null;
+  const travelers = Number(prefs.travelers);
+  const breakdown = prefs.travelerBreakdown && typeof prefs.travelerBreakdown === "object"
+    ? prefs.travelerBreakdown
+    : null;
+
+  const adults = Number(breakdown?.adults);
+  const children = Number(breakdown?.children);
+  const infants = Number(breakdown?.infants);
+  const pets = Number(breakdown?.pets);
+
+  return {
+    destination: prefs.destination ? String(prefs.destination).trim() : null,
+    destinationPlaceId: prefs.destinationPlaceId ? String(prefs.destinationPlaceId).trim() : null,
+    roadTrip: Boolean(prefs.roadTrip),
+    startDate: normalizeDateInput(prefs.startDate),
+    endDate: normalizeDateInput(prefs.endDate),
+    travelers: Number.isFinite(travelers) ? Math.max(1, Math.round(travelers)) : null,
+    travelerBreakdown: {
+      adults: Number.isFinite(adults) ? Math.max(0, Math.round(adults)) : 0,
+      children: Number.isFinite(children) ? Math.max(0, Math.round(children)) : 0,
+      infants: Number.isFinite(infants) ? Math.max(0, Math.round(infants)) : 0,
+      pets: Number.isFinite(pets) ? Math.max(0, Math.round(pets)) : 0,
+    },
+    budget: prefs.budget ? String(prefs.budget).trim().toLowerCase() : null,
+  };
+}
+
+function deriveAdultCount(userPrefs, fallback = 1) {
+  const adultsFromBreakdown = Number(userPrefs?.travelerBreakdown?.adults);
+  if (Number.isFinite(adultsFromBreakdown) && adultsFromBreakdown > 0) {
+    return Math.max(1, Math.min(9, Math.round(adultsFromBreakdown)));
+  }
+  const travelerTotal = Number(userPrefs?.travelers);
+  if (Number.isFinite(travelerTotal) && travelerTotal > 0) {
+    return Math.max(1, Math.min(9, Math.round(travelerTotal)));
+  }
+  return Math.max(1, Math.min(9, Math.round(fallback)));
 }
 
 function pickTopMatchByName(list, query) {
@@ -1209,8 +1283,9 @@ async function buildTripPlanFromPrompt({
   }
 
   const dayCount =
-    Math.max(1, Math.min(5, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1)) ||
+    Math.max(1, Math.min(10, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1)) ||
     2;
+  const adultsCount = deriveAdultCount(overrides?.userPrefs, 2);
 
   let resolvedTripId = tripId || null;
   if (tripId) {
@@ -1256,52 +1331,58 @@ async function buildTripPlanFromPrompt({
     });
   }
 
-  const needAttractions = true;
+  const needAttractions = !overrides?.userPrefs?.roadTrip;
   const needHotel = true;
 
   let attractionLocation = null;
   let attractionsList = [];
-  if (needAttractions) {
-    try {
-      attractionLocation = await resolveAttractionLocation(resolvedDestination);
-      if (attractionLocation?.id) {
-        const searchData = await searchAttractions({
-          id: attractionLocation.id,
-          page: 1,
-          currency_code: "USD",
-          languagecode: "en-us",
-          sortBy: "trending",
-        });
-        attractionsList = normalizeAttractions(searchData)?.products || [];
-      }
-    } catch {
-      attractionsList = [];
-    }
-  }
-
   let hotelResult = null;
-  if (needHotel) {
-    try {
-      const destination = await resolveHotelDestination(resolvedDestination);
-      if (destination?.dest_id && destination?.search_type) {
-        const hotelData = await searchHotels({
-          dest_id: destination.dest_id,
-          search_type: destination.search_type,
-          arrival_date: startDate,
-          departure_date: endDate,
-          adults: 2,
-          room_qty: 1,
-          page_number: 1,
-          currency_code: "USD",
-          languagecode: "en-us",
-        });
-        const normalized = normalizeHotelsResponse(hotelData);
-        hotelResult = normalized?.hotels?.[0] || null;
-      }
-    } catch {
-      hotelResult = null;
-    }
-  }
+  const attractionPromise = needAttractions
+    ? (async () => {
+        try {
+          attractionLocation = await resolveAttractionLocation(resolvedDestination);
+          if (attractionLocation?.id) {
+            const searchData = await searchAttractions({
+              id: attractionLocation.id,
+              page: 1,
+              currency_code: "USD",
+              languagecode: "en-us",
+              sortBy: "trending",
+            });
+            attractionsList = normalizeAttractions(searchData)?.products || [];
+          }
+        } catch {
+          attractionsList = [];
+        }
+      })()
+    : Promise.resolve();
+
+  const hotelPromise = needHotel
+    ? (async () => {
+        try {
+          const destination = await resolveHotelDestination(resolvedDestination);
+          if (destination?.dest_id && destination?.search_type) {
+            const hotelData = await searchHotels({
+              dest_id: destination.dest_id,
+              search_type: destination.search_type,
+              arrival_date: startDate,
+              departure_date: endDate,
+              adults: adultsCount,
+              room_qty: 1,
+              page_number: 1,
+              currency_code: "USD",
+              languagecode: "en-us",
+            });
+            const normalized = normalizeHotelsResponse(hotelData);
+            hotelResult = normalized?.hotels?.[0] || null;
+          }
+        } catch {
+          hotelResult = null;
+        }
+      })()
+    : Promise.resolve();
+
+  await Promise.all([attractionPromise, hotelPromise]);
 
   let restaurantsList = [];
   try {
@@ -1352,7 +1433,7 @@ async function buildTripPlanFromPrompt({
             toId: toLoc.id,
             departDate: startDate,
             returnDate: endDate,
-            adults: 1,
+            adults: adultsCount,
             currencyCode: "USD",
           });
           cacheSet(cacheKey, response, 1000 * 60 * 10);
@@ -1425,6 +1506,7 @@ async function buildTripPlanFromPrompt({
   const usedTitles = new Set();
   const attractionPool = [...attractionsList];
   const restaurantPool = [...restaurantsList];
+  const placeLookupCache = new Map();
 
   const addUniqueItem = (list, item) => {
     if (!item) return;
@@ -1442,6 +1524,41 @@ async function buildTripPlanFromPrompt({
   const returnDepartMinutes = parseTimeToMinutes(flightPreview?.returnDepartAt);
   const hasReturnFlight =
     Boolean(flightPreview?.returnDepartAt) || Boolean(flightPreview?.returnArriveAt);
+
+  const findPlaceOnce = async (textQuery) => {
+    const key = normalizeTitleKey(textQuery);
+    if (!key) return null;
+    if (placeLookupCache.has(key)) return placeLookupCache.get(key);
+
+    try {
+      const fieldMask = [
+        "places.id",
+        "places.displayName",
+        "places.location",
+        "places.formattedAddress",
+        "places.shortFormattedAddress",
+        "places.rating",
+        "places.userRatingCount",
+        "places.photos",
+      ].join(",");
+      const body = { textQuery, maxResultCount: 1 };
+      if (center?.lat && center?.lng) {
+        body.locationBias = {
+          circle: {
+            center: { latitude: center.lat, longitude: center.lng },
+            radius: 6000,
+          },
+        };
+      }
+      const data = await placesSearchTextNew(body, fieldMask);
+      const place = Array.isArray(data?.places) ? data.places[0] : null;
+      placeLookupCache.set(key, place || null);
+      return place || null;
+    } catch {
+      placeLookupCache.set(key, null);
+      return null;
+    }
+  };
 
   for (let i = 0; i < dayCount; i += 1) {
     const date = toDateString(addDays(new Date(startDate), i));
@@ -1647,52 +1764,25 @@ async function buildTripPlanFromPrompt({
       }
 
       if (item?.type === "place" || item?.type === "attraction") {
-        try {
-          const fieldMask = [
-            "places.id",
-            "places.displayName",
-            "places.location",
-            "places.formattedAddress",
-            "places.shortFormattedAddress",
-            "places.rating",
-            "places.userRatingCount",
-            "places.photos",
-          ].join(",");
-          const textQuery = item?.query || item?.title || "things to do";
-          const body = {
-            textQuery,
-            maxResultCount: 1,
-          };
-          if (center?.lat && center?.lng) {
-            body.locationBias = {
-              circle: {
-                center: { latitude: center.lat, longitude: center.lng },
-                radius: 6000,
-              },
-            };
-          }
-          const data = await placesSearchTextNew(body, fieldMask);
-          const place = Array.isArray(data?.places) ? data.places[0] : null;
-          if (place?.id) {
-            const photoRef = place?.photos?.[0]?.name || null;
-            addUniqueItem(itineraryItems, {
-              ...base,
-              type: "place",
-              title: place?.displayName?.text || base.title,
-              subtitle:
-                place?.shortFormattedAddress || place?.formattedAddress || resolvedDestination,
-              source: "google",
-              sourceId: place.id,
-              lat: place?.location?.latitude ?? null,
-              lng: place?.location?.longitude ?? null,
-              imageUrl: photoRef ? buildPhotoUrl(photoRef, 500) : null,
-              rating: place?.rating ?? null,
-              meta: { userRatingCount: place?.userRatingCount ?? null },
-            });
-            continue;
-          }
-        } catch {
-          // fall through
+        const textQuery = item?.query || item?.title || "things to do";
+        const place = await findPlaceOnce(textQuery);
+        if (place?.id) {
+          const photoRef = place?.photos?.[0]?.name || null;
+          addUniqueItem(itineraryItems, {
+            ...base,
+            type: "place",
+            title: place?.displayName?.text || base.title,
+            subtitle:
+              place?.shortFormattedAddress || place?.formattedAddress || resolvedDestination,
+            source: "google",
+            sourceId: place.id,
+            lat: place?.location?.latitude ?? null,
+            lng: place?.location?.longitude ?? null,
+            imageUrl: photoRef ? buildPhotoUrl(photoRef, 500) : null,
+            rating: place?.rating ?? null,
+            meta: { userRatingCount: place?.userRatingCount ?? null },
+          });
+          continue;
         }
       }
     }
@@ -1888,7 +1978,7 @@ export async function assistantRoutes(app) {
   });
 
   app.post("/chat", async (req, reply) => {
-    const { message, tripId } = req.body || {};
+    const { message, tripId, createTripPrefs: createTripPrefsRaw } = req.body || {};
     if (!message) {
       return reply.code(400).send({ error: "Missing message" });
     }
@@ -1897,6 +1987,8 @@ export async function assistantRoutes(app) {
     if (!authUser) return;
 
     const ctx = getAssistantContext(authUser, tripId);
+    const createTripPrefs = normalizeCreateTripPrefs(createTripPrefsRaw);
+    const effectiveUserPrefs = createTripPrefs || ctx?.createTripPrefs || null;
     const detectedLocation = detectLocationInMessage(message);
     const detectedMode = detectTravelMode(message);
     if (detectedLocation) {
@@ -1904,6 +1996,9 @@ export async function assistantRoutes(app) {
     }
     if (detectedMode) {
       setAssistantContext(authUser, tripId, { travelMode: detectedMode });
+    }
+    if (createTripPrefs) {
+      setAssistantContext(authUser, tripId, { createTripPrefs });
     }
 
     if (ctx?.pendingPlan) {
@@ -1917,7 +2012,11 @@ export async function assistantRoutes(app) {
             destinationLabel: ctx.pendingPlan.destinationLabel,
             startDate: parsedDates.startDate,
             endDate: parsedDates.endDate,
-            userPrefs: ctx.pendingPlan.userPrefs || undefined,
+            userPrefs:
+              createTripPrefs ||
+              ctx.pendingPlan.userPrefs ||
+              ctx?.createTripPrefs ||
+              undefined,
           },
         });
         setAssistantContext(authUser, tripId, { pendingPlan: null });
@@ -1931,12 +2030,38 @@ export async function assistantRoutes(app) {
       }
     }
 
+    if (createTripPrefs?.destination) {
+      const result = await buildTripPlanFromPrompt({
+        promptText: message,
+        tripId,
+        authUser,
+        overrides: {
+          destinationLabel: createTripPrefs.destination,
+          startDate: createTripPrefs.startDate || null,
+          endDate: createTripPrefs.endDate || null,
+          userPrefs: createTripPrefs,
+        },
+      });
+      if (result?.assistantMessage) {
+        return reply.send({
+          assistantMessage: result.assistantMessage,
+          planId: result.plan?.id,
+          tripId: result.tripId,
+        });
+      }
+    }
+
     if (messageMentionsTripPlan(message)) {
       const result = await buildTripPlanFromPrompt({
         promptText: message,
         tripId,
         authUser,
-        overrides: {},
+        overrides: {
+          destinationLabel: createTripPrefs?.destination || undefined,
+          startDate: createTripPrefs?.startDate || null,
+          endDate: createTripPrefs?.endDate || null,
+          userPrefs: createTripPrefs || ctx?.createTripPrefs || undefined,
+        },
       });
       if (result?.assistantMessage) {
         if (result?.error === "missing_dates" || result?.error === "missing_destination") {
@@ -1944,7 +2069,7 @@ export async function assistantRoutes(app) {
             pendingPlan: {
               promptText: message,
               destinationLabel: detectLocationInMessage(message) || ctx.location || null,
-              userPrefs: null,
+              userPrefs: effectiveUserPrefs,
             },
           });
         }
@@ -2014,7 +2139,7 @@ export async function assistantRoutes(app) {
           search_type: destination.search_type,
           arrival_date: checkIn,
           departure_date: checkOut,
-          adults: 1,
+          adults: deriveAdultCount(effectiveUserPrefs, 1),
           room_qty: 1,
           page_number: 1,
           units: "metric",
@@ -2061,7 +2186,7 @@ export async function assistantRoutes(app) {
               city: destination?.label || cityText,
               checkIn,
               checkOut,
-              adults: 1,
+              adults: deriveAdultCount(effectiveUserPrefs, 1),
             },
           },
           {
@@ -2101,6 +2226,7 @@ export async function assistantRoutes(app) {
         modifiersOverride: modifiers,
         clientLat,
         clientLng,
+        logger: req.log,
       });
       if (locationText) setAssistantContext(authUser, tripId, { location: locationText });
       return reply.send(payload);
@@ -2108,6 +2234,34 @@ export async function assistantRoutes(app) {
 
     if (messageMentionsActivities(message)) {
       const locationText = parseActivityLocation(message) || detectedLocation || ctx.location || null;
+      const nearMe =
+        (message || "").toLowerCase().includes("near me") ||
+        (message || "").toLowerCase().includes("nearby");
+      const clientLat = Number(req.body?.clientLat);
+      const clientLng = Number(req.body?.clientLng);
+      const explicitBookable = messageWantsBookableActivities(message);
+
+      if (!explicitBookable) {
+        const payload = await handlePlacesIntent({
+          message,
+          tripId,
+          authUser,
+          locationText,
+          nearMe,
+          isRestaurantIntent: false,
+          queryOverride: stripLocationAndVerbs(message) || "things to do",
+          modifiersOverride: extractSpotModifiers(message),
+          clientLat,
+          clientLng,
+          logger: req.log,
+        });
+        if (locationText) setAssistantContext(authUser, tripId, { location: locationText });
+        if (typeof payload?.assistantMessage === "string") {
+          payload.assistantMessage = payload.assistantMessage.replace(/spots/g, "things to do");
+        }
+        return reply.send(payload);
+      }
+
       if (!locationText) {
         return reply.send({
           assistantMessage: "Which city should I use for attractions?",
@@ -2269,6 +2423,7 @@ export async function assistantRoutes(app) {
             },
             clientLat,
             clientLng,
+            logger: req.log,
           });
           if (llm.location) setAssistantContext(authUser, tripId, { location: llm.location });
           return reply.send(payload);
@@ -2369,7 +2524,7 @@ export async function assistantRoutes(app) {
           toId: toLoc.id,
           departDate,
           returnDate,
-          adults: 1,
+          adults: deriveAdultCount(effectiveUserPrefs, 1),
           currencyCode: "USD",
         });
         cacheSet(cacheKey, response, 1000 * 60 * 10);

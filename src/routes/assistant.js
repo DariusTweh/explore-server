@@ -1200,6 +1200,54 @@ function getDepartureTimeWindowOk(departureAt, timeWindow) {
   return true;
 }
 
+function parseDurationSec(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  const iso = text.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/i);
+  if (iso) {
+    const hours = Number(iso[1] || 0);
+    const mins = Number(iso[2] || 0);
+    const secs = Number(iso[3] || 0);
+    return hours * 3600 + mins * 60 + secs;
+  }
+  const plain = Number(text);
+  return Number.isFinite(plain) ? plain : null;
+}
+
+function diffSecondsFromTimes(departAt, arriveAt) {
+  const departMs = new Date(departAt || "").getTime();
+  const arriveMs = new Date(arriveAt || "").getTime();
+  if (!Number.isFinite(departMs) || !Number.isFinite(arriveMs)) return null;
+  let diff = Math.round((arriveMs - departMs) / 1000);
+  if (diff < 0) diff += 24 * 3600;
+  return diff > 0 ? diff : null;
+}
+
+function moneyToNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (!value || typeof value !== "object") return null;
+  if (typeof value.amount === "number" && Number.isFinite(value.amount)) return value.amount;
+  if (typeof value.amount === "string") {
+    const parsed = Number(value.amount);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (typeof value.value === "number" && Number.isFinite(value.value)) return value.value;
+  if (typeof value.value === "string") {
+    const parsed = Number(value.value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (typeof value.units === "number") {
+    return Number(value.units) + Number(value.nanos || 0) / 1e9;
+  }
+  return null;
+}
+
 async function resolveIataCode(keyword) {
   const primary = sanitizeLocationText(keyword);
   if (!primary) return null;
@@ -2631,25 +2679,31 @@ export async function assistantRoutes(app) {
         offer?.price?.amount ||
         offer?.totalPrice ||
         offer?.total;
-      const price =
-        typeof priceObj === "number"
-          ? priceObj
-          : typeof priceObj?.amount === "number"
-            ? priceObj.amount
-            : typeof priceObj?.units === "number"
-              ? Number(priceObj.units) + Number(priceObj.nanos || 0) / 1e9
-              : null;
+      const departAt = firstSegment?.departure?.at || firstSegment?.departureTime || null;
+      const arriveAt = lastSegment?.arrival?.at || lastSegment?.arrivalTime || null;
+      const durationSec =
+        parseDurationSec(offer?.duration) ||
+        parseDurationSec(firstSegment?.duration) ||
+        parseDurationSec(offer?.totalDuration) ||
+        diffSecondsFromTimes(departAt, arriveAt);
+      const price = moneyToNumber(priceObj) || moneyToNumber(offer?.price);
 
       return {
         providerId: offer?.token || offer?.id || `${fromLoc.id}-${toLoc.id}-${index}`,
         from: fromLoc.code || fromLoc.label,
         to: toLoc.code || toLoc.label,
-        departAt: firstSegment?.departure?.at || firstSegment?.departureTime || null,
-        arriveAt: lastSegment?.arrival?.at || lastSegment?.arrivalTime || null,
+        departAt,
+        arriveAt,
+        durationSec,
         stops: Math.max(segments.length - 1, 0),
         price,
         currency:
-          priceObj?.currencyCode || priceObj?.currency || offer?.currency || "USD",
+          priceObj?.currencyCode ||
+          priceObj?.currency ||
+          offer?.price?.currencyCode ||
+          offer?.price?.currency ||
+          offer?.currency ||
+          "USD",
         airline: airlineName || airline,
         airlineLogoUrl,
       };

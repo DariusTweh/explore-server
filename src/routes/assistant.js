@@ -1165,10 +1165,29 @@ async function createQuickTrip({ userId, primaryLocationName, startDate, endDate
 function getDepartureTimeWindowOk(departureAt, timeWindow) {
   if (timeWindow === "any") return true;
   if (!departureAt) return false;
-  const timePart = departureAt.split("T")[1] || "";
-  const [hourStr, minStr] = timePart.split(":");
-  const hour = Number(hourStr);
-  const minute = Number(minStr);
+  const text = String(departureAt || "").trim();
+  if (!text) return false;
+
+  let hour = NaN;
+  let minute = NaN;
+
+  // ISO-like strings: 2026-03-01T08:25:00 or 2026-03-01 08:25
+  const isoMatch = text.match(/(?:T|\s)(\d{1,2}):(\d{2})/);
+  if (isoMatch) {
+    hour = Number(isoMatch[1]);
+    minute = Number(isoMatch[2]);
+  } else {
+    // Time-only formats: 08:25 or 8:25 AM
+    const timeOnlyMatch = text.match(/(\d{1,2}):(\d{2})(?:\s*([ap]m))?/i);
+    if (timeOnlyMatch) {
+      hour = Number(timeOnlyMatch[1]);
+      minute = Number(timeOnlyMatch[2]);
+      const meridiem = String(timeOnlyMatch[3] || "").toLowerCase();
+      if (meridiem === "pm" && hour < 12) hour += 12;
+      if (meridiem === "am" && hour === 12) hour = 0;
+    }
+  }
+
   if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false;
 
   const minutes = hour * 60 + minute;
@@ -2570,7 +2589,7 @@ export async function assistantRoutes(app) {
         : Array.isArray(response?.results)
           ? response.results
           : [];
-    const filtered = offers.filter((offer) => {
+    const timeMatched = offers.filter((offer) => {
       const firstSegment =
         offer?.segments?.[0] ||
         offer?.legs?.[0]?.segments?.[0] ||
@@ -2579,6 +2598,9 @@ export async function assistantRoutes(app) {
         firstSegment?.departure?.at || firstSegment?.departureTime || null;
       return getDepartureTimeWindowOk(departAt, timeWindow);
     });
+    const hadTimeWindow = timeWindow && timeWindow !== "any";
+    const fallbackToUnfiltered = hadTimeWindow && offers.length > 0 && timeMatched.length === 0;
+    const filtered = fallbackToUnfiltered ? offers : timeMatched;
 
     const previewCards = filtered.slice(0, 5).map((offer, index) => {
       const segments =
@@ -2634,7 +2656,9 @@ export async function assistantRoutes(app) {
     });
 
     const assistantMessage = previewCards.length
-      ? `Here are a few ${fromLoc.code || fromLoc.label} → ${toLoc.code || toLoc.label} options.`
+      ? fallbackToUnfiltered
+        ? `I couldn't find exact ${timeWindow.replace("_", " ")} departures, but here are the best available ${fromLoc.code || fromLoc.label} → ${toLoc.code || toLoc.label} options.`
+        : `Here are a few ${fromLoc.code || fromLoc.label} → ${toLoc.code || toLoc.label} options.`
       : `I couldn't find flights from ${fromLoc.code || fromLoc.label} to ${toLoc.code || toLoc.label}.`;
 
     return reply.send({

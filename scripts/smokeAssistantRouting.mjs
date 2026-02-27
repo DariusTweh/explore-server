@@ -25,6 +25,11 @@ const ACTIVITY_KEYWORDS = [
   "things to do",
   "thing to do",
   "what to do",
+  "what should i do",
+  "what should we do",
+  "what can i do",
+  "sightseeing",
+  "sight seeing",
   "attraction",
   "attractions",
   "activity",
@@ -163,6 +168,69 @@ function detectTravelMode(message) {
     return "fly";
   }
   return null;
+}
+
+function isFollowupReply(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  if (text.split(/\s+/).length <= 8) return true;
+  const genericFollowups = [
+    "nothing specific",
+    "just find me something",
+    "surprise me",
+    "whatever works",
+    "anything",
+    "something fun",
+    "something chill",
+    "sight seeing",
+    "sightseeing",
+  ];
+  return genericFollowups.some((phrase) => text.includes(phrase));
+}
+
+function normalizePendingIntent(value) {
+  const intent = String(value || "").trim().toLowerCase();
+  if (
+    intent === "activities" ||
+    intent === "spots" ||
+    intent === "restaurants" ||
+    intent === "hotels" ||
+    intent === "flights" ||
+    intent === "trip_plan"
+  ) {
+    return intent;
+  }
+  return null;
+}
+
+function getEffectiveIntent(message, ctx) {
+  const pendingIntent = normalizePendingIntent(ctx?.pendingIntent);
+  const explicit = {
+    tripPlan: messageMentionsTripPlan(message),
+    hotels: messageMentionsHotels(message),
+    spots: messageMentionsSpots(message),
+    restaurants: messageMentionsRestaurants(message),
+    activities: messageMentionsActivities(message),
+    flights: messageMentionsFlights(message),
+  };
+  if (
+    !explicit.tripPlan &&
+    !explicit.hotels &&
+    !explicit.spots &&
+    !explicit.restaurants &&
+    !explicit.activities &&
+    !explicit.flights &&
+    pendingIntent &&
+    isFollowupReply(message)
+  ) {
+    if (pendingIntent === "restaurants") explicit.restaurants = true;
+    if (pendingIntent === "spots") explicit.spots = true;
+    if (pendingIntent === "activities") explicit.activities = true;
+    if (pendingIntent === "hotels") explicit.hotels = true;
+    if (pendingIntent === "flights") explicit.flights = true;
+    if (pendingIntent === "trip_plan") explicit.tripPlan = true;
+  }
+  return explicit;
 }
 
 function parseRoute(message) {
@@ -308,6 +376,16 @@ const cases = [
     expect: "rome",
   },
   {
+    label: "what should i do counts as activity intent",
+    run: () => messageMentionsActivities("what should i do in amsterdam"),
+    expect: true,
+  },
+  {
+    label: "what should i do parses activity city",
+    run: () => parseActivityLocation("what should i do in amsterdam"),
+    expect: "amsterdam",
+  },
+  {
     label: "activity location trims temporal suffix",
     run: () => parseActivityLocation("activities in Tokyo next week"),
     expect: "tokyo",
@@ -361,6 +439,21 @@ const cases = [
     label: "chat prompt does not look like flight",
     run: () => messageMentionsFlights("how are you today"),
     expect: false,
+  },
+  {
+    label: "short followup inherits activities intent",
+    run: () => getEffectiveIntent("sight seeing", { pendingIntent: "activities" }).activities,
+    expect: true,
+  },
+  {
+    label: "generic followup inherits activities intent",
+    run: () => getEffectiveIntent("nothing specific just find me something", { pendingIntent: "activities" }).activities,
+    expect: true,
+  },
+  {
+    label: "followup does not inherit without pending intent",
+    run: () => getEffectiveIntent("sight seeing", {}).activities,
+    expect: true,
   },
   {
     label: "hotel prompt does not look like activity",

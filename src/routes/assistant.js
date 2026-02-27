@@ -53,6 +53,11 @@ const ACTIVITY_KEYWORDS = [
   "things to do",
   "thing to do",
   "what to do",
+  "what should i do",
+  "what should we do",
+  "what can i do",
+  "sightseeing",
+  "sight seeing",
   "attraction",
   "attractions",
   "activity",
@@ -178,6 +183,69 @@ function messageMentionsHotels(message) {
 function messageMentionsActivities(message) {
   const text = (message || "").toLowerCase();
   return ACTIVITY_KEYWORDS.some((kw) => text.includes(kw));
+}
+
+function isFollowupReply(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  if (text.split(/\s+/).length <= 8) return true;
+  const genericFollowups = [
+    "nothing specific",
+    "just find me something",
+    "surprise me",
+    "whatever works",
+    "anything",
+    "something fun",
+    "something chill",
+    "sight seeing",
+    "sightseeing",
+  ];
+  return genericFollowups.some((phrase) => text.includes(phrase));
+}
+
+function normalizePendingIntent(value) {
+  const intent = String(value || "").trim().toLowerCase();
+  if (
+    intent === "activities" ||
+    intent === "spots" ||
+    intent === "restaurants" ||
+    intent === "hotels" ||
+    intent === "flights" ||
+    intent === "trip_plan"
+  ) {
+    return intent;
+  }
+  return null;
+}
+
+function getEffectiveIntent(message, ctx) {
+  const pendingIntent = normalizePendingIntent(ctx?.pendingIntent);
+  const explicit = {
+    tripPlan: messageMentionsTripPlan(message),
+    hotels: messageMentionsHotels(message),
+    spots: messageMentionsSpots(message),
+    restaurants: messageMentionsRestaurants(message),
+    activities: messageMentionsActivities(message),
+    flights: messageMentionsFlights(message),
+  };
+  if (
+    !explicit.tripPlan &&
+    !explicit.hotels &&
+    !explicit.spots &&
+    !explicit.restaurants &&
+    !explicit.activities &&
+    !explicit.flights &&
+    pendingIntent &&
+    isFollowupReply(message)
+  ) {
+    if (pendingIntent === "restaurants") explicit.restaurants = true;
+    if (pendingIntent === "spots") explicit.spots = true;
+    if (pendingIntent === "activities") explicit.activities = true;
+    if (pendingIntent === "hotels") explicit.hotels = true;
+    if (pendingIntent === "flights") explicit.flights = true;
+    if (pendingIntent === "trip_plan") explicit.tripPlan = true;
+  }
+  return explicit;
 }
 
 function messageWantsBookableActivities(message) {
@@ -380,6 +448,7 @@ function parseActivityLocation(message) {
   const keywordPatterns = [
     /(?:things?\s+to\s+do|what\s+to\s+do|attractions?|activities?|tours?|experiences?)\s+in\s+(.+)/i,
     /(?:things?\s+to\s+do|what\s+to\s+do|attractions?|activities?|tours?|experiences?)\s+at\s+(.+)/i,
+    /(?:what\s+should\s+i\s+do|what\s+should\s+we\s+do|what\s+can\s+i\s+do)\s+in\s+(.+)/i,
     /(?:find|show|search)\s+(?:things?\s+to\s+do|attractions?|activities?|tours?|experiences?)\s+in\s+(.+)/i,
   ];
 
@@ -2113,6 +2182,7 @@ export async function assistantRoutes(app) {
     if (!authUser) return;
 
     const ctx = getAssistantContext(authUser, tripId);
+    const effectiveIntent = getEffectiveIntent(message, ctx);
     const createTripPrefs = normalizeCreateTripPrefs(createTripPrefsRaw);
     const effectiveUserPrefs = createTripPrefs || ctx?.createTripPrefs || null;
     const detectedLocation = detectLocationInMessage(message);
@@ -2177,7 +2247,7 @@ export async function assistantRoutes(app) {
       }
     }
 
-    if (messageMentionsTripPlan(message)) {
+    if (effectiveIntent.tripPlan) {
       const result = await buildTripPlanFromPrompt({
         promptText: message,
         tripId,
@@ -2207,9 +2277,10 @@ export async function assistantRoutes(app) {
       }
     }
 
-    if (messageMentionsHotels(message)) {
+    if (effectiveIntent.hotels) {
       const cityText = parseHotelCity(message) || detectedLocation || ctx.location || null;
       if (!cityText) {
+        setAssistantContext(authUser, tripId, { pendingIntent: "hotels" });
         return reply.send({ assistantMessage: "Which city are you staying in?" });
       }
 
@@ -2298,6 +2369,11 @@ export async function assistantRoutes(app) {
         };
       });
 
+      setAssistantContext(authUser, tripId, {
+        pendingIntent: null,
+        lastIntent: "hotels",
+        location: destination?.label || cityText,
+      });
       return reply.send({
         assistantMessage: `Here are a few hotel options in ${destination?.label || cityText}.`,
         cards,
@@ -2331,15 +2407,21 @@ export async function assistantRoutes(app) {
       });
     }
 
-    if (messageMentionsSpots(message)) {
+    if (effectiveIntent.spots || effectiveIntent.restaurants) {
       const locationText = parseSpotLocation(message) || detectedLocation || ctx.location || null;
       const modifiers = extractSpotModifiers(message);
       const nearMe =
         (message || "").toLowerCase().includes("near me") ||
         (message || "").toLowerCase().includes("nearby");
-      const isRestaurantIntent = messageMentionsRestaurants(message);
+      const isRestaurantIntent = effectiveIntent.restaurants;
       const clientLat = Number(req.body?.clientLat);
       const clientLng = Number(req.body?.clientLng);
+
+      if (!nearMe && !locationText) {
+        setAssistantContext(authUser, tripId, {
+          pendingIntent: isRestaurantIntent ? "restaurants" : "spots",
+        });
+      }
 
       const payload = await handlePlacesIntent({
         message,
@@ -2354,11 +2436,17 @@ export async function assistantRoutes(app) {
         clientLng,
         logger: req.log,
       });
-      if (locationText) setAssistantContext(authUser, tripId, { location: locationText });
+      if (locationText) {
+        setAssistantContext(authUser, tripId, {
+          pendingIntent: null,
+          lastIntent: isRestaurantIntent ? "restaurants" : "spots",
+          location: locationText,
+        });
+      }
       return reply.send(payload);
     }
 
-    if (messageMentionsActivities(message)) {
+    if (effectiveIntent.activities) {
       const locationText = parseActivityLocation(message) || detectedLocation || ctx.location || null;
       const nearMe =
         (message || "").toLowerCase().includes("near me") ||
@@ -2368,6 +2456,9 @@ export async function assistantRoutes(app) {
       const explicitBookable = messageWantsBookableActivities(message);
 
       if (!explicitBookable) {
+        if (!locationText && !nearMe) {
+          setAssistantContext(authUser, tripId, { pendingIntent: "activities" });
+        }
         const payload = await handlePlacesIntent({
           message,
           tripId,
@@ -2381,7 +2472,13 @@ export async function assistantRoutes(app) {
           clientLng,
           logger: req.log,
         });
-        if (locationText) setAssistantContext(authUser, tripId, { location: locationText });
+        if (locationText) {
+          setAssistantContext(authUser, tripId, {
+            pendingIntent: null,
+            lastIntent: "activities",
+            location: locationText,
+          });
+        }
         if (typeof payload?.assistantMessage === "string") {
           payload.assistantMessage = payload.assistantMessage.replace(/spots/g, "things to do");
         }
@@ -2389,6 +2486,7 @@ export async function assistantRoutes(app) {
       }
 
       if (!locationText) {
+        setAssistantContext(authUser, tripId, { pendingIntent: "activities" });
         return reply.send({
           assistantMessage: "Which city should I use for attractions?",
         });
@@ -2467,7 +2565,13 @@ export async function assistantRoutes(app) {
       }));
 
       const displayLocation = location?.label || locationText;
-      if (displayLocation) setAssistantContext(authUser, tripId, { location: displayLocation });
+      if (displayLocation) {
+        setAssistantContext(authUser, tripId, {
+          pendingIntent: null,
+          lastIntent: "activities",
+          location: displayLocation,
+        });
+      }
       return reply.send({
         assistantMessage: cards.length
           ? `Here are some experiences in ${displayLocation}.`
@@ -2509,7 +2613,7 @@ export async function assistantRoutes(app) {
           "Got it — driving. Want hotels, restaurants, or things to do in your destination?",
       });
     }
-    if (!messageMentionsFlights(message) && !parsed) {
+    if (!effectiveIntent.flights && !parsed) {
       const llm = await classifyAssistantIntent(message);
       if (llm && llm.confidence >= 0.65) {
         if (llm.intent === "trip_plan") {
@@ -2520,6 +2624,11 @@ export async function assistantRoutes(app) {
             overrides: {
               destinationLabel: llm.location || undefined,
             },
+          });
+          setAssistantContext(authUser, tripId, {
+            pendingIntent: result?.error === "missing_dates" || result?.error === "missing_destination"
+              ? "trip_plan"
+              : null,
           });
           if (result?.assistantMessage) {
             return reply.send({
@@ -2551,8 +2660,19 @@ export async function assistantRoutes(app) {
             clientLng,
             logger: req.log,
           });
-          if (llm.location) setAssistantContext(authUser, tripId, { location: llm.location });
+          setAssistantContext(authUser, tripId, {
+            pendingIntent: null,
+            lastIntent: llm.intent,
+            location: llm.location || ctx.location || null,
+          });
           return reply.send(payload);
+        }
+
+        if (llm.intent === "hotels" && (llm.location || ctx.location) && llm.confidence >= 0.65) {
+          setAssistantContext(authUser, tripId, {
+            pendingIntent: "hotels",
+            location: llm.location || ctx.location || null,
+          });
         }
 
         if (llm.intent === "chat") {
@@ -2579,6 +2699,7 @@ export async function assistantRoutes(app) {
 
     if (!parsed) parsed = parseRoute(message);
     if (!parsed?.fromText || !parsed?.toText) {
+      setAssistantContext(authUser, tripId, { pendingIntent: "flights" });
       return reply.send({ assistantMessage: "From where to where?" });
     }
 
@@ -2595,6 +2716,7 @@ export async function assistantRoutes(app) {
     }
 
     if (!fromLoc?.id || !toLoc?.id) {
+      setAssistantContext(authUser, tripId, { pendingIntent: "flights" });
       return reply.send({ assistantMessage: "From where to where?" });
     }
 
@@ -2770,6 +2892,11 @@ export async function assistantRoutes(app) {
         : `Here are a few ${fromLoc.code || fromLoc.label} → ${toLoc.code || toLoc.label} options.`
       : `I couldn't find flights from ${fromLoc.code || fromLoc.label} to ${toLoc.code || toLoc.label}.`;
 
+    setAssistantContext(authUser, tripId, {
+      pendingIntent: null,
+      lastIntent: "flights",
+      location: parsed?.toText || ctx.location || null,
+    });
     return reply.send({
       assistantMessage,
       cards: previewCards,

@@ -93,21 +93,38 @@ const BOOKING_URL_KEYS = [
   "deepLink",
   "checkoutUrl",
   "checkout_url",
+  "deep_link",
+  "redirectUrl",
+  "redirect_url",
+  "bookingLink",
+  "booking_link",
   "url",
   "link",
 ];
 
-const extractFirstUrl = (input) => {
+const looksLikeUrl = (value) => typeof value === "string" && /^https?:\/\//i.test(value.trim());
+
+const rankUrl = (url) => {
+  const value = String(url || "").toLowerCase();
+  if (value.includes("flights.booking.com/flights/")) return 100;
+  if (value.includes("booking.com/flights")) return 95;
+  if (value.includes("booking.com")) return 90;
+  if (value.includes("checkout") || value.includes("book")) return 80;
+  return 10;
+};
+
+const extractBookingUrls = (input) => {
   if (!input) return null;
   const queue = [input];
+  const found = new Set();
   while (queue.length) {
     const current = queue.shift();
     if (!current) continue;
-    if (typeof current === "string" && /^https?:\/\//i.test(current)) return current;
+    if (looksLikeUrl(current)) found.add(current.trim());
     if (typeof current !== "object") continue;
     for (const key of BOOKING_URL_KEYS) {
       const candidate = current?.[key];
-      if (typeof candidate === "string" && /^https?:\/\//i.test(candidate)) return candidate;
+      if (looksLikeUrl(candidate)) found.add(candidate.trim());
     }
     if (Array.isArray(current)) {
       current.forEach((item) => queue.push(item));
@@ -115,7 +132,7 @@ const extractFirstUrl = (input) => {
       Object.values(current).forEach((value) => queue.push(value));
     }
   }
-  return null;
+  return [...found].sort((a, b) => rankUrl(b) - rankUrl(a));
 };
 
 export async function getFlightBookingUrl({ token }) {
@@ -128,8 +145,8 @@ export async function getFlightBookingUrl({ token }) {
   for (const attempt of attempts) {
     try {
       const res = await rapidGet(attempt.path, { qs: attempt.qs });
-      const url = extractFirstUrl(res?.data || res);
-      if (url) return { url, raw: res };
+      const urls = extractBookingUrls(res?.data || res) || [];
+      if (urls.length) return { url: urls[0], candidates: urls, raw: res };
     } catch {
       // Keep trying supported endpoints for provider variance.
     }

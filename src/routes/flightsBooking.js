@@ -2,6 +2,7 @@ import { getFlightBookingUrl } from "../providers/bookingcom/flights.js";
 
 const ALLOWED_BOOKING_HOSTS = [
   "booking.com",
+  "flights.booking.com",
   "secure.booking.com",
   "gotogate.com",
   "expedia.com",
@@ -19,7 +20,8 @@ const isAllowedHost = (host) => {
 
 const sanitizeBookingUrl = (value) => {
   try {
-    const url = new URL(String(value || ""));
+    const cleaned = String(value || "").trim().replace(/^['"]|['"]$/g, "");
+    const url = new URL(cleaned);
     if (!/^https?:$/i.test(url.protocol)) return null;
     if (!isAllowedHost(url.hostname)) return null;
     return url.toString();
@@ -37,6 +39,15 @@ export async function flightsBookingRoutes(app) {
       const resolved = await getFlightBookingUrl({ token });
       const safeUrl = sanitizeBookingUrl(resolved?.url);
       if (!safeUrl) {
+        const fallbackCandidate = Array.isArray(resolved?.candidates)
+          ? resolved.candidates.map((candidate) => sanitizeBookingUrl(candidate)).find(Boolean)
+          : null;
+        if (fallbackCandidate) {
+          return reply.send({
+            url: fallbackCandidate,
+            provider: "bookingcom15",
+          });
+        }
         return reply.code(400).send({ error: "Unsafe or invalid booking URL returned" });
       }
 

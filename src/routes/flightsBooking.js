@@ -4,6 +4,8 @@ const ALLOWED_BOOKING_HOSTS = [
   "booking.com",
   "flights.booking.com",
   "secure.booking.com",
+  "bstatic.com",
+  "r-xx.bstatic.com",
   "gotogate.com",
   "expedia.com",
   "travelpayouts.com",
@@ -22,7 +24,7 @@ const sanitizeBookingUrl = (value) => {
   try {
     const cleaned = String(value || "").trim().replace(/^['"]|['"]$/g, "");
     const url = new URL(cleaned);
-    if (!/^https?:$/i.test(url.protocol)) return null;
+    if (String(url.protocol).toLowerCase() !== "https:") return null;
     if (!isAllowedHost(url.hostname)) return null;
     return url.toString();
   } catch {

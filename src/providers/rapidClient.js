@@ -1,7 +1,6 @@
-
-const BASE_URL = "https://booking-com15.p.rapidapi.com";
-const HOST = "booking-com15.p.rapidapi.com";
-const RAPID_API_KEY = process.env.RAPID_API_KEY;
+const HOST = process.env.RAPIDAPI_HOST || "booking-com15.p.rapidapi.com";
+const BASE_URL = `https://${HOST}`;
+const RAPID_API_KEY = process.env.RAPID_API_KEY || process.env.RAPIDAPI_KEY;
 
 const MAX_ATTEMPTS = 3;
 

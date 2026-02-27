@@ -6,6 +6,7 @@ export function normalizeHotel(hotel) {
   return {
     hotelId: hotel?.hotel_id || property?.id || null,
     name: property?.name || null,
+    url: property?.url || property?.webpageUrl || hotel?.url || null,
     imageUrl: property?.photoUrls?.[0] || null,
     reviewScore: property?.reviewScore ?? null,
     reviewScoreWord: property?.reviewScoreWord || null,

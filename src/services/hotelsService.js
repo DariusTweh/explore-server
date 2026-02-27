@@ -13,3 +13,10 @@ export async function searchHotels(params) {
   });
   return response?.data ?? null;
 }
+
+export async function getRoomListWithAvailability(params) {
+  const response = await rapidGet("/api/v1/hotels/getRoomListWithAvailability", {
+    qs: { ...params },
+  });
+  return response ?? null;
+}

@@ -98,14 +98,37 @@ const BOOKING_URL_KEYS = [
   "redirect_url",
   "bookingLink",
   "booking_link",
-  "url",
-  "link",
 ];
 
 const looksLikeUrl = (value) => typeof value === "string" && /^https?:\/\//i.test(value.trim());
 
+const isLegalOrPolicyUrl = (url) => {
+  const value = String(url || "").toLowerCase();
+  return (
+    value.includes("terms") ||
+    value.includes("privacy") ||
+    value.includes("policy") ||
+    value.includes("legal") ||
+    value.includes("conditions") ||
+    value.includes("cookie")
+  );
+};
+
+const isLikelyBookingUrl = (url) => {
+  if (isLegalOrPolicyUrl(url)) return false;
+  const value = String(url || "").toLowerCase();
+  return (
+    value.includes("flights.booking.com/flights/") ||
+    value.includes("booking.com/flights") ||
+    value.includes("checkout") ||
+    value.includes("book") ||
+    value.includes("redirect")
+  );
+};
+
 const rankUrl = (url) => {
   const value = String(url || "").toLowerCase();
+  if (isLegalOrPolicyUrl(value)) return -1;
   if (value.includes("flights.booking.com/flights/")) return 100;
   if (value.includes("booking.com/flights")) return 95;
   if (value.includes("booking.com")) return 90;
@@ -132,7 +155,9 @@ const extractBookingUrls = (input) => {
       Object.values(current).forEach((value) => queue.push(value));
     }
   }
-  return [...found].sort((a, b) => rankUrl(b) - rankUrl(a));
+  return [...found]
+    .filter((url) => isLikelyBookingUrl(url))
+    .sort((a, b) => rankUrl(b) - rankUrl(a));
 };
 
 export async function getFlightBookingUrl({ token }) {

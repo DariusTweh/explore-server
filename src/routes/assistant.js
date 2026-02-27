@@ -40,7 +40,15 @@ const FLIGHT_KEYWORDS = [
   "redeye",
 ];
 
-const HOTEL_KEYWORDS = ["hotel", "hotels", "stay", "stays", "accommodation", "lodging"];
+const HOTEL_KEYWORDS = [
+  "hotel",
+  "hotels",
+  "stay",
+  "stays",
+  "staying",
+  "accommodation",
+  "lodging",
+];
 const ACTIVITY_KEYWORDS = [
   "things to do",
   "thing to do",
@@ -222,7 +230,19 @@ function sanitizeLocationText(text) {
       cleaned = cleaned.slice(0, idx).trim();
     }
   }
+  cleaned = cleaned.replace(/\b(?:please|thanks|thank you|asap)\b$/i, "").trim();
   return cleaned;
+}
+
+function trimTemporalLocationSuffix(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(
+      /\b(next week|next month|this weekend|this week|tomorrow|today|tonight|for \d+ nights?|for \d+ days?)\b.*$/i,
+      ""
+    )
+    .replace(/^(?:in|at|near|around)\s+/i, "")
+    .trim();
 }
 
 function detectLocationInMessage(message) {
@@ -343,9 +363,15 @@ function parseTimeToMinutes(isoLike) {
 function parseHotelCity(message) {
   const text = (message || "").toLowerCase();
   const inMatch = text.match(/(?:hotel|hotels|stay|stays|accommodation|lodging)\s+in\s+(.+)/i);
-  if (inMatch) return sanitizeLocationText(inMatch[1]);
+  if (inMatch) return trimTemporalLocationSuffix(sanitizeLocationText(inMatch[1]));
   const atMatch = text.match(/(?:hotel|hotels|stay|stays|accommodation|lodging)\s+at\s+(.+)/i);
-  if (atMatch) return sanitizeLocationText(atMatch[1]);
+  if (atMatch) return trimTemporalLocationSuffix(sanitizeLocationText(atMatch[1]));
+  const stayingMatch = text.match(/(?:staying(?:\s+in)?|stay\s+in)\s+(.+)/i);
+  if (stayingMatch) return trimTemporalLocationSuffix(sanitizeLocationText(stayingMatch[1]));
+  const nearMatch = text.match(
+    /(?:hotel|hotels|stay|stays|staying|accommodation|lodging)\s+(?:near|around)\s+(.+)/i
+  );
+  if (nearMatch) return trimTemporalLocationSuffix(sanitizeLocationText(nearMatch[1]));
   return null;
 }
 
@@ -359,12 +385,17 @@ function parseActivityLocation(message) {
 
   for (const pattern of keywordPatterns) {
     const match = text.match(pattern);
-    if (match?.[1]) return sanitizeLocationText(match[1]);
+    if (match?.[1]) return trimTemporalLocationSuffix(sanitizeLocationText(match[1]));
   }
 
   const generic = text.match(/\b(?:in|at|near)\s+([a-z\s'-]{2,})$/i);
   if (generic?.[1] && messageMentionsActivities(message)) {
-    return sanitizeLocationText(generic[1]);
+    return trimTemporalLocationSuffix(sanitizeLocationText(generic[1]));
+  }
+
+  const aroundMatch = text.match(/\b(?:around)\s+([a-z\s'-]{2,})$/i);
+  if (aroundMatch?.[1] && messageMentionsActivities(message)) {
+    return trimTemporalLocationSuffix(sanitizeLocationText(aroundMatch[1]));
   }
 
   return null;

@@ -10,6 +10,7 @@ import { hotelDetailsRoutes } from "./routes/hotelDetails.js";
 import { attractionsRoutes } from "./routes/attractions.js";
 import { placesRoutes } from "./routes/places.js";
 import { exploreRoutes } from "./routes/explore.js";
+import { flightsBookingRoutes } from "./routes/flightsBooking.js";
 
 const app = Fastify({ logger: true });
 
@@ -17,6 +18,7 @@ await app.register(cors, { origin: true });
 
 await app.register(onboardingRoutes);
 await app.register(searchRoutes, { prefix: "/api/search" });
+await app.register(flightsBookingRoutes, { prefix: "/api/flights" });
 await app.register(hotelsRoutes, { prefix: "/api/hotels" });
 await app.register(hotelDetailsRoutes, { prefix: "/api/hotels" });
 await app.register(attractionsRoutes, { prefix: "/api/attractions" });

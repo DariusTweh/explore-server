@@ -50,7 +50,7 @@ export async function searchRoutes(app) {
   const parseDurationSec = (val) => {
     if (typeof val === "number") return val;
     if (!val || typeof val !== "string") return null;
-    const match = val.match(/PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)S)?/);
+    const match = val.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
     if (!match) return null;
     const hours = Number(match[1] || 0);
     const mins = Number(match[2] || 0);
@@ -220,6 +220,8 @@ export async function searchRoutes(app) {
 
       const payload = {
         aggregation: data?.aggregation || data?.filters || null,
+        flightDeals: data?.flightDeals || data?.aggregation?.flightDeals || null,
+        flightOffers: Array.isArray(offersRaw) ? offersRaw : [],
         offers,
       };
 

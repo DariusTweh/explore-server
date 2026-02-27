@@ -85,3 +85,57 @@ export async function getFlightDetails({ token, currencyCode = "USD" }) {
   const res = await rapidGet("/api/v1/flights/getFlightDetails", { qs });
   return res?.data ?? null;
 }
+
+const BOOKING_URL_KEYS = [
+  "bookingUrl",
+  "booking_url",
+  "deeplink",
+  "deepLink",
+  "checkoutUrl",
+  "checkout_url",
+  "url",
+  "link",
+];
+
+const extractFirstUrl = (input) => {
+  if (!input) return null;
+  const queue = [input];
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current) continue;
+    if (typeof current === "string" && /^https?:\/\//i.test(current)) return current;
+    if (typeof current !== "object") continue;
+    for (const key of BOOKING_URL_KEYS) {
+      const candidate = current?.[key];
+      if (typeof candidate === "string" && /^https?:\/\//i.test(candidate)) return candidate;
+    }
+    if (Array.isArray(current)) {
+      current.forEach((item) => queue.push(item));
+    } else {
+      Object.values(current).forEach((value) => queue.push(value));
+    }
+  }
+  return null;
+};
+
+export async function getFlightBookingUrl({ token }) {
+  const attempts = [
+    { path: "/api/v1/flights/getBookingUrl", qs: { token } },
+    { path: "/api/v1/flights/getFlightBookingUrl", qs: { token } },
+    { path: "/api/v1/flights/getFlightDetails", qs: { token } },
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const res = await rapidGet(attempt.path, { qs: attempt.qs });
+      const url = extractFirstUrl(res?.data || res);
+      if (url) return { url, raw: res };
+    } catch {
+      // Keep trying supported endpoints for provider variance.
+    }
+  }
+
+  const err = new Error("No booking URL found for this token");
+  err.status = 404;
+  throw err;
+}

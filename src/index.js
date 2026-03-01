@@ -11,6 +11,7 @@ import { attractionsRoutes } from "./routes/attractions.js";
 import { placesRoutes } from "./routes/places.js";
 import { exploreRoutes } from "./routes/explore.js";
 import { flightsBookingRoutes } from "./routes/flightsBooking.js";
+import { chatsRoutes } from "./routes/chats.js";
 
 const app = Fastify({ logger: true });
 
@@ -26,6 +27,7 @@ await app.register(placesRoutes, { prefix: "/api/places" });
 await app.register(exploreRoutes, { prefix: "/api/explore" });
 await app.register(tripsRoutes, { prefix: "/api/trips" });
 await app.register(assistantRoutes, { prefix: "/api/assistant" });
+await app.register(chatsRoutes, { prefix: "/api/chats" });
 app.get("/ping", async () => "pong");
 
 const port = Number(process.env.PORT || 8787);

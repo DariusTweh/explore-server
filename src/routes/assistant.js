@@ -712,6 +712,7 @@ function sanitizeAttractionId(value) {
 async function handlePlacesIntent({
   message,
   tripId,
+  workspaceId,
   authUser,
   locationText,
   nearMe,
@@ -744,24 +745,7 @@ async function handlePlacesIntent({
       .single();
     if (error || !data?.id) resolvedTripId = null;
   }
-
-  if (!resolvedTripId && locationText) {
-    const startDate = toDateString(addDays(new Date(), 30));
-    const endDate = toDateString(addDays(new Date(startDate), 3));
-
-    try {
-      const created = await createQuickTrip({
-        userId: authUser.id,
-        primaryLocationName: locationText,
-        startDate,
-        endDate,
-        title: `${locationText} • ${startDate}–${endDate}`,
-      });
-      resolvedTripId = created?.id || null;
-    } catch (err) {
-      resolvedTripId = null;
-    }
-  }
+  const resultRefId = resolvedTripId || workspaceId || null;
 
   const hasClientLocation =
     Number.isFinite(clientLat) &&
@@ -883,7 +867,7 @@ async function handlePlacesIntent({
         type: "view_all_spots",
         label: "View all",
         params: {
-          tripId: resolvedTripId,
+          tripId: resultRefId,
           tab: isRestaurantIntent ? "restaurant" : "spots",
           category: categoryLabel,
           label: resolved.label || locationText || "Spots",
@@ -897,7 +881,7 @@ async function handlePlacesIntent({
         type: "view_map_spots",
         label: "Map",
         params: {
-          tripId: resolvedTripId,
+          tripId: resultRefId,
           source: "spots",
         },
       },
@@ -921,7 +905,7 @@ async function handlePlacesIntent({
         searchMode,
       },
     },
-    tripId: resolvedTripId,
+    tripId: resultRefId,
   };
   logger?.info?.(
     {
@@ -1494,14 +1478,10 @@ async function buildTripPlanFromPrompt({
   }
 
   if (!resolvedTripId) {
-    const created = await createQuickTrip({
-      userId: authUser.id,
-      primaryLocationName: resolvedDestination,
-      startDate,
-      endDate,
-      title: `${resolvedDestination} • ${startDate}–${endDate}`,
-    });
-    resolvedTripId = created?.id || null;
+    return {
+      error: "trip_required",
+      assistantMessage: "Use Create a Trip to save a full itinerary. I can still help with flights, stays, and things to do here.",
+    };
   }
 
   const center = await resolveSpotCenter({
@@ -2173,7 +2153,7 @@ export async function assistantRoutes(app) {
   });
 
   app.post("/chat", async (req, reply) => {
-    const { message, tripId, createTripPrefs: createTripPrefsRaw } = req.body || {};
+    const { message, tripId, workspaceId, createTripPrefs: createTripPrefsRaw } = req.body || {};
     if (!message) {
       return reply.code(400).send({ error: "Missing message" });
     }
@@ -2181,20 +2161,21 @@ export async function assistantRoutes(app) {
     const authUser = await requireAuth(req, reply);
     if (!authUser) return;
 
-    const ctx = getAssistantContext(authUser, tripId);
+    const contextId = workspaceId || tripId;
+    const ctx = getAssistantContext(authUser, contextId);
     const effectiveIntent = getEffectiveIntent(message, ctx);
     const createTripPrefs = normalizeCreateTripPrefs(createTripPrefsRaw);
     const effectiveUserPrefs = createTripPrefs || ctx?.createTripPrefs || null;
     const detectedLocation = detectLocationInMessage(message);
     const detectedMode = detectTravelMode(message);
     if (detectedLocation) {
-      setAssistantContext(authUser, tripId, { location: detectedLocation });
+      setAssistantContext(authUser, contextId, { location: detectedLocation });
     }
     if (detectedMode) {
-      setAssistantContext(authUser, tripId, { travelMode: detectedMode });
+      setAssistantContext(authUser, contextId, { travelMode: detectedMode });
     }
     if (createTripPrefs) {
-      setAssistantContext(authUser, tripId, { createTripPrefs });
+      setAssistantContext(authUser, contextId, { createTripPrefs });
     }
 
     if (ctx?.pendingPlan) {
@@ -2215,7 +2196,7 @@ export async function assistantRoutes(app) {
               undefined,
           },
         });
-        setAssistantContext(authUser, tripId, { pendingPlan: null });
+        setAssistantContext(authUser, contextId, { pendingPlan: null });
         if (result?.assistantMessage) {
           return reply.send({
             assistantMessage: result.assistantMessage,
@@ -2261,7 +2242,7 @@ export async function assistantRoutes(app) {
       });
       if (result?.assistantMessage) {
         if (result?.error === "missing_dates" || result?.error === "missing_destination") {
-          setAssistantContext(authUser, tripId, {
+          setAssistantContext(authUser, contextId, {
             pendingPlan: {
               promptText: message,
               destinationLabel: detectLocationInMessage(message) || ctx.location || null,
@@ -2280,7 +2261,7 @@ export async function assistantRoutes(app) {
     if (effectiveIntent.hotels) {
       const cityText = parseHotelCity(message) || detectedLocation || ctx.location || null;
       if (!cityText) {
-        setAssistantContext(authUser, tripId, { pendingIntent: "hotels" });
+        setAssistantContext(authUser, contextId, { pendingIntent: "hotels" });
         return reply.send({ assistantMessage: "Which city are you staying in?" });
       }
 
@@ -2309,20 +2290,8 @@ export async function assistantRoutes(app) {
         const checkOutDate = toDateString(addDays(new Date(checkInDate), 3));
         checkIn = checkInDate;
         checkOut = checkOutDate;
-
-        try {
-          const created = await createQuickTrip({
-            userId: authUser.id,
-            primaryLocationName: cityText,
-            startDate: checkIn,
-            endDate: checkOut,
-            title: `${cityText} • ${checkIn}–${checkOut}`,
-          });
-          resolvedTripId = created?.id || null;
-        } catch (err) {
-          return reply.code(500).send({ error: err?.message ?? "Failed to create trip" });
-        }
       }
+      const resultRefId = resolvedTripId || workspaceId || null;
 
       let destination;
       let hotelsResponse;
@@ -2369,7 +2338,7 @@ export async function assistantRoutes(app) {
         };
       });
 
-      setAssistantContext(authUser, tripId, {
+      setAssistantContext(authUser, contextId, {
         pendingIntent: null,
         lastIntent: "hotels",
         location: destination?.label || cityText,
@@ -2382,7 +2351,7 @@ export async function assistantRoutes(app) {
             type: "view_all_hotels",
             label: "View all",
             params: {
-              tripId: resolvedTripId,
+              tripId: resultRefId,
               dest_id: destination?.dest_id,
               search_type: destination?.search_type,
               city: destination?.label || cityText,
@@ -2395,7 +2364,7 @@ export async function assistantRoutes(app) {
             type: "view_map_hotels",
             label: "Map",
             params: {
-              tripId: resolvedTripId,
+              tripId: resultRefId,
               source: "hotels",
               city: destination?.label || cityText,
               checkIn,
@@ -2403,7 +2372,7 @@ export async function assistantRoutes(app) {
             },
           },
         ],
-        tripId: resolvedTripId,
+        tripId: resultRefId,
       });
     }
 
@@ -2418,7 +2387,7 @@ export async function assistantRoutes(app) {
       const clientLng = Number(req.body?.clientLng);
 
       if (!nearMe && !locationText) {
-        setAssistantContext(authUser, tripId, {
+        setAssistantContext(authUser, contextId, {
           pendingIntent: isRestaurantIntent ? "restaurants" : "spots",
         });
       }
@@ -2426,6 +2395,7 @@ export async function assistantRoutes(app) {
       const payload = await handlePlacesIntent({
         message,
         tripId,
+        workspaceId,
         authUser,
         locationText,
         nearMe,
@@ -2437,7 +2407,7 @@ export async function assistantRoutes(app) {
         logger: req.log,
       });
       if (locationText) {
-        setAssistantContext(authUser, tripId, {
+        setAssistantContext(authUser, contextId, {
           pendingIntent: null,
           lastIntent: isRestaurantIntent ? "restaurants" : "spots",
           location: locationText,
@@ -2457,11 +2427,12 @@ export async function assistantRoutes(app) {
 
       if (!explicitBookable) {
         if (!locationText && !nearMe) {
-          setAssistantContext(authUser, tripId, { pendingIntent: "activities" });
+          setAssistantContext(authUser, contextId, { pendingIntent: "activities" });
         }
         const payload = await handlePlacesIntent({
           message,
           tripId,
+          workspaceId,
           authUser,
           locationText,
           nearMe,
@@ -2473,7 +2444,7 @@ export async function assistantRoutes(app) {
           logger: req.log,
         });
         if (locationText) {
-          setAssistantContext(authUser, tripId, {
+          setAssistantContext(authUser, contextId, {
             pendingIntent: null,
             lastIntent: "activities",
             location: locationText,
@@ -2486,7 +2457,7 @@ export async function assistantRoutes(app) {
       }
 
       if (!locationText) {
-        setAssistantContext(authUser, tripId, { pendingIntent: "activities" });
+        setAssistantContext(authUser, contextId, { pendingIntent: "activities" });
         return reply.send({
           assistantMessage: "Which city should I use for attractions?",
         });
@@ -2503,23 +2474,7 @@ export async function assistantRoutes(app) {
         if (error || !data?.id) resolvedTripId = null;
       }
 
-      if (!resolvedTripId) {
-        const startDate = toDateString(addDays(new Date(), 30));
-        const endDate = toDateString(addDays(new Date(startDate), 3));
-
-        try {
-          const created = await createQuickTrip({
-            userId: authUser.id,
-            primaryLocationName: locationText,
-            startDate,
-            endDate,
-            title: `${locationText} • ${startDate}–${endDate}`,
-          });
-          resolvedTripId = created?.id || null;
-        } catch (err) {
-          return reply.code(500).send({ error: err?.message ?? "Failed to create trip" });
-        }
-      }
+      const resultRefId = resolvedTripId || workspaceId || null;
 
       let location;
       let normalized;
@@ -2566,7 +2521,7 @@ export async function assistantRoutes(app) {
 
       const displayLocation = location?.label || locationText;
       if (displayLocation) {
-        setAssistantContext(authUser, tripId, {
+        setAssistantContext(authUser, contextId, {
           pendingIntent: null,
           lastIntent: "activities",
           location: displayLocation,
@@ -2582,7 +2537,7 @@ export async function assistantRoutes(app) {
             type: "view_all_activities",
             label: "View all",
             params: {
-              tripId: resolvedTripId,
+              tripId: resultRefId,
               locationId: location?.id,
               locationLabel: displayLocation,
               city: location?.city || locationText,
@@ -2594,7 +2549,7 @@ export async function assistantRoutes(app) {
             type: "view_map_activities",
             label: "Map",
             params: {
-              tripId: resolvedTripId,
+              tripId: resultRefId,
               source: "experiences",
               locationId: location?.id,
               locationLabel: displayLocation,
@@ -2602,7 +2557,7 @@ export async function assistantRoutes(app) {
             },
           },
         ],
-        tripId: resolvedTripId,
+        tripId: resultRefId,
       });
     }
 
@@ -2625,7 +2580,7 @@ export async function assistantRoutes(app) {
               destinationLabel: llm.location || undefined,
             },
           });
-          setAssistantContext(authUser, tripId, {
+          setAssistantContext(authUser, contextId, {
             pendingIntent: result?.error === "missing_dates" || result?.error === "missing_destination"
               ? "trip_plan"
               : null,
@@ -2645,6 +2600,7 @@ export async function assistantRoutes(app) {
           const payload = await handlePlacesIntent({
             message,
             tripId,
+            workspaceId,
             authUser,
             locationText: llm.location || null,
             nearMe: !!llm.nearMe,
@@ -2660,7 +2616,7 @@ export async function assistantRoutes(app) {
             clientLng,
             logger: req.log,
           });
-          setAssistantContext(authUser, tripId, {
+          setAssistantContext(authUser, contextId, {
             pendingIntent: null,
             lastIntent: llm.intent,
             location: llm.location || ctx.location || null,
@@ -2669,7 +2625,7 @@ export async function assistantRoutes(app) {
         }
 
         if (llm.intent === "hotels" && (llm.location || ctx.location) && llm.confidence >= 0.65) {
-          setAssistantContext(authUser, tripId, {
+          setAssistantContext(authUser, contextId, {
             pendingIntent: "hotels",
             location: llm.location || ctx.location || null,
           });
@@ -2699,7 +2655,7 @@ export async function assistantRoutes(app) {
 
     if (!parsed) parsed = parseRoute(message);
     if (!parsed?.fromText || !parsed?.toText) {
-      setAssistantContext(authUser, tripId, { pendingIntent: "flights" });
+      setAssistantContext(authUser, contextId, { pendingIntent: "flights" });
       return reply.send({ assistantMessage: "From where to where?" });
     }
 
@@ -2716,7 +2672,7 @@ export async function assistantRoutes(app) {
     }
 
     if (!fromLoc?.id || !toLoc?.id) {
-      setAssistantContext(authUser, tripId, { pendingIntent: "flights" });
+      setAssistantContext(authUser, contextId, { pendingIntent: "flights" });
       return reply.send({ assistantMessage: "From where to where?" });
     }
 
@@ -2745,20 +2701,8 @@ export async function assistantRoutes(app) {
       const ret = addDays(depart, 3);
       departDate = toDateString(depart);
       returnDate = toDateString(ret);
-
-      try {
-        const created = await createQuickTrip({
-          userId: authUser.id,
-          primaryLocationName: parsed?.toText || "Quick Trip",
-          startDate: departDate,
-          endDate: returnDate,
-          title: `${parsed?.fromText || "Trip"} • ${departDate}–${returnDate}`,
-        });
-        resolvedTripId = created?.id || null;
-      } catch (err) {
-        return reply.code(500).send({ error: err?.message ?? "Failed to create trip" });
-      }
     }
+    const resultRefId = resolvedTripId || workspaceId || null;
 
     let response;
     try {
@@ -2892,7 +2836,7 @@ export async function assistantRoutes(app) {
         : `Here are a few ${fromLoc.code || fromLoc.label} → ${toLoc.code || toLoc.label} options.`
       : `I couldn't find flights from ${fromLoc.code || fromLoc.label} to ${toLoc.code || toLoc.label}.`;
 
-    setAssistantContext(authUser, tripId, {
+    setAssistantContext(authUser, contextId, {
       pendingIntent: null,
       lastIntent: "flights",
       location: parsed?.toText || ctx.location || null,
@@ -2905,7 +2849,7 @@ export async function assistantRoutes(app) {
           type: "view_all_flights",
           label: "View all",
           params: {
-            tripId: resolvedTripId,
+            tripId: resultRefId,
             fromId: fromLoc.id,
             toId: toLoc.id,
             fromLabel: fromLoc.code || fromLoc.label,
@@ -2916,7 +2860,7 @@ export async function assistantRoutes(app) {
           },
         },
       ],
-      tripId: resolvedTripId,
+      tripId: resultRefId,
     });
   });
 }

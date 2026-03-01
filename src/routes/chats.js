@@ -102,6 +102,57 @@ export async function chatsRoutes(app) {
     return reply.send((Array.isArray(data) ? data : []).reverse());
   });
 
+  app.post("/:threadId/messages", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+
+    const { threadId } = req.params;
+    const role = String(req.body?.role || "").trim();
+    const content = String(req.body?.content || "").trim();
+
+    if ((role !== "user" && role !== "assistant") || !content) {
+      return reply.code(400).send({ error: "Role and content are required" });
+    }
+
+    const thread = await getOwnedThread(threadId, authUser.id);
+    if (!thread) {
+      return reply.code(404).send({ error: "Chat not found" });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("chat_messages")
+      .insert({
+        thread_id: threadId,
+        user_id: authUser.id,
+        role,
+        content,
+      })
+      .select("id, role, content, created_at")
+      .single();
+
+    if (error) {
+      req.log.error({ error }, "save chat message failed");
+      return reply.code(500).send({ error: "Failed to save message" });
+    }
+
+    if (!thread.title && role === "user") {
+      const title = buildThreadTitle(content);
+      if (title) {
+        const { error: titleError } = await supabaseAdmin
+          .from("chat_threads")
+          .update({ title })
+          .eq("id", threadId)
+          .eq("user_id", authUser.id);
+
+        if (titleError) {
+          req.log.warn({ error: titleError }, "update chat thread title failed");
+        }
+      }
+    }
+
+    return reply.send(data);
+  });
+
   app.post("/:threadId/send", async (req, reply) => {
     const authUser = await requireAuth(req, reply);
     if (!authUser) return;

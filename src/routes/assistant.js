@@ -27,6 +27,11 @@ import { bookingGet } from "../utils/bookingClient.js";
 import { getCoordsFromCache, upsertCoordsCache } from "../utils/coordsCache.js";
 import { geocodeMapbox } from "../utils/geocodeMapbox.js";
 import { generatePlanOutline } from "../utils/planOutline.js";
+import {
+  buildFlightSubtitle,
+  shortlistFlightOffers,
+} from "../utils/scoreFlights.js";
+import { scheduleDay, SCHEDULE_DEFAULTS } from "../utils/scheduleDay.js";
 
 const FLIGHT_KEYWORDS = [
   "flight",
@@ -175,6 +180,42 @@ function messageMentionsFlights(message) {
   return FLIGHT_KEYWORDS.some((kw) => text.includes(kw));
 }
 
+function messageWantsRoundTrip(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("round trip") ||
+    text.includes("roundtrip") ||
+    text.includes("return flight") ||
+    text.includes("return flights") ||
+    text.includes("returning") ||
+    text.includes("with return") ||
+    text.includes("back on")
+  );
+}
+
+function messageWantsOneWay(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return text.includes("one way") || text.includes("one-way") || text.includes("oneway");
+}
+
+function messageMentionsFlightAdjustment(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    messageWantsRoundTrip(text) ||
+    messageWantsOneWay(text) ||
+    text.includes("keep same date") ||
+    text.includes("keep same dates") ||
+    text.includes("same dates") ||
+    text.includes("switch destination") ||
+    text.includes("change destination") ||
+    text.includes("make it") ||
+    text.includes("instead")
+  );
+}
+
 function messageMentionsHotels(message) {
   const text = (message || "").toLowerCase();
   return HOTEL_KEYWORDS.some((kw) => text.includes(kw));
@@ -201,6 +242,18 @@ function isFollowupReply(message) {
     "sightseeing",
   ];
   return genericFollowups.some((phrase) => text.includes(phrase));
+}
+
+function messageLooksGeneralInfoQuestion(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  const questionLead = /^(what|which|who|where|when|why|how)\b/i.test(text);
+  const infoSignals =
+    /\b(currency|language|timezone|time zone|weather|population|capital|visa|religion|culture)\b/i.test(
+      text
+    );
+  const hasRouteSignal = /\bfrom\s+.+\s+to\s+.+\b/i.test(text);
+  return (questionLead || infoSignals) && !hasRouteSignal;
 }
 
 function normalizePendingIntent(value) {
@@ -236,7 +289,8 @@ function getEffectiveIntent(message, ctx) {
     !explicit.activities &&
     !explicit.flights &&
     pendingIntent &&
-    isFollowupReply(message)
+    isFollowupReply(message) &&
+    !messageLooksGeneralInfoQuestion(message)
   ) {
     if (pendingIntent === "restaurants") explicit.restaurants = true;
     if (pendingIntent === "spots") explicit.spots = true;
@@ -285,6 +339,66 @@ function messageMentionsTripPlan(message) {
   return PLAN_KEYWORDS.some((kw) => text.includes(kw));
 }
 
+function messageAsksForSummary(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("summarize") ||
+    text.includes("summary") ||
+    text.includes("recap") ||
+    text.includes("what we decided") ||
+    text.includes("what did we decide")
+  );
+}
+
+function messageIsAffirmative(message) {
+  const text = String(message || "").trim().toLowerCase();
+  return ["yes", "y", "yep", "yeah", "sure", "ok", "okay", "please do"].includes(text);
+}
+
+function applyContextualLocationHint(message, location) {
+  const text = String(message || "");
+  const loc = String(location || "").trim();
+  if (!text || !loc) return text;
+  if (!/\bthere\b/i.test(text)) return text;
+  if (detectLocationInMessage(text)) return text;
+  return text.replace(/\bthere\b/gi, `in ${loc}`);
+}
+
+function buildContextSummaryMessage(ctx) {
+  const parts = [];
+  const flight = ctx?.lastFlight;
+  if (flight?.fromLabel && flight?.toLabel && flight?.departDate) {
+    const tripType = flight?.returnDate ? "round-trip" : "one-way";
+    const dateText = flight?.returnDate
+      ? `${flight.departDate} to ${flight.returnDate}`
+      : flight.departDate;
+    const timeText = flight?.timeWindow && flight.timeWindow !== "any"
+      ? ` (${flight.timeWindow.replace("_", " ")})`
+      : "";
+    parts.push(`Flights: ${tripType} ${flight.fromLabel} -> ${flight.toLabel} on ${dateText}${timeText}.`);
+  }
+  if (ctx?.lastHotel?.city) {
+    const hotelDates = ctx.lastHotel.checkIn && ctx.lastHotel.checkOut
+      ? ` (${ctx.lastHotel.checkIn} to ${ctx.lastHotel.checkOut})`
+      : "";
+    parts.push(`Hotels: searching in ${ctx.lastHotel.city}${hotelDates}.`);
+  }
+  if (ctx?.lastPlaces?.category && ctx?.lastPlaces?.location) {
+    const modifierText = ctx.lastPlaces.openNow ? " (open now)" : "";
+    parts.push(
+      `${ctx.lastPlaces.category === "restaurants" ? "Dining" : "Spots"}: ${ctx.lastPlaces.category} in ${ctx.lastPlaces.location}${modifierText}.`
+    );
+  }
+  if (ctx?.lastIntent && !parts.length) {
+    parts.push(`Latest focus: ${ctx.lastIntent.replace("_", " ")}.`);
+  }
+  if (!parts.length) {
+    return "We have not locked in concrete decisions yet. Share your route or destination and I will summarize as we go.";
+  }
+  return `Here is the recap:\n- ${parts.join("\n- ")}`;
+}
+
 function sanitizeLocationText(text) {
   if (!text) return "";
   let cleaned = text.toLowerCase();
@@ -316,6 +430,8 @@ function trimTemporalLocationSuffix(text) {
 function detectLocationInMessage(message) {
   const text = (message || "").toLowerCase();
   const patterns = [
+    /\b(?:what about)\s+([a-z\s'-]{2,})/i,
+    /\b(?:where is|where's|tell me about)\s+([a-z\s'-]{2,})/i,
     /\b(?:going to|traveling to|trip to|heading to|visiting|visit)\s+([a-z\s'-]{2,})/i,
     /\b(?:in|around|near|at)\s+([a-z\s'-]{2,})/i,
   ];
@@ -324,6 +440,32 @@ function detectLocationInMessage(message) {
     if (match?.[1]) return sanitizeLocationText(match[1]);
   }
   return null;
+}
+
+function detectStandaloneLocationReply(message) {
+  const cleaned = sanitizeLocationText(message);
+  if (!cleaned) return null;
+  const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
+  if (wordCount > 5) return null;
+  if (/\d/.test(cleaned)) return null;
+  if (
+    [
+      "yes",
+      "no",
+      "maybe",
+      "not sure",
+      "tomorrow",
+      "today",
+      "next week",
+      "this weekend",
+      "morning",
+      "afternoon",
+      "evening",
+    ].includes(cleaned)
+  ) {
+    return null;
+  }
+  return cleaned;
 }
 
 function detectTravelMode(message) {
@@ -354,25 +496,58 @@ function setAssistantContext(authUser, tripId, patch) {
   return next;
 }
 
+function cleanRouteEndpoint(text) {
+  if (!text) return "";
+  return trimTemporalLocationSuffix(sanitizeLocationText(text))
+    .replace(
+      /\b(next|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*$/i,
+      ""
+    )
+    .replace(
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b.*$/i,
+      ""
+    )
+    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b.*$/i, "")
+    .replace(/\b(?:on|for|during|leaving|departing)\b.*$/i, "")
+    .trim();
+}
+
 function parseRoute(message) {
   const text = (message || "").toLowerCase();
   const fromToMatch = text.match(/from\s+(.+?)\s+to\s+(.+)/i);
   if (fromToMatch) {
     return {
-      fromText: sanitizeLocationText(fromToMatch[1].trim()),
-      toText: sanitizeLocationText(fromToMatch[2].trim()),
+      fromText: cleanRouteEndpoint(fromToMatch[1].trim()),
+      toText: cleanRouteEndpoint(fromToMatch[2].trim()),
     };
   }
 
   const simpleMatch = text.match(/([a-z\s]+?)\s+to\s+([a-z\s]+)/i);
   if (simpleMatch) {
+    const fromCandidate = cleanRouteEndpoint(simpleMatch[1].trim());
+    const toCandidate = cleanRouteEndpoint(simpleMatch[2].trim());
+    const invalidFrom =
+      !fromCandidate ||
+      /\b(?:switch|change|destination|make it|instead|actually|keep same dates?)\b/i.test(
+        fromCandidate
+      );
+    if (invalidFrom) return null;
     return {
-      fromText: sanitizeLocationText(simpleMatch[1].trim()),
-      toText: sanitizeLocationText(simpleMatch[2].trim()),
+      fromText: fromCandidate,
+      toText: toCandidate,
     };
   }
 
   return null;
+}
+
+function parseFlightDestinationOnly(message) {
+  const text = (message || "").toLowerCase();
+  const match = text.match(
+    /\b(?:to|destination(?:\s+to)?|switch destination to|change destination to)\s+([a-z\s'-]{2,})/i
+  );
+  if (!match?.[1]) return null;
+  return cleanRouteEndpoint(match[1]);
 }
 
 function parseOriginDestinationForPlan(message) {
@@ -428,18 +603,33 @@ function parseTimeToMinutes(isoLike) {
   return hour * 60 + min;
 }
 
+function minutesToClock(totalMinutes) {
+  const value = Math.max(0, Math.round(Number(totalMinutes) || 0));
+  const hh = String(Math.floor(value / 60)).padStart(2, "0");
+  const mm = String(value % 60).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
 function parseHotelCity(message) {
   const text = (message || "").toLowerCase();
+  const cleanHotelCity = (value) =>
+    trimTemporalLocationSuffix(sanitizeLocationText(value))
+      .replace(
+        /\b(?:find|show|book|need|looking|search|with|for|please|can you|could you|help me)\b.*$/i,
+        ""
+      )
+      .replace(/\b(?:near|close to)\s+transit\b.*$/i, "")
+      .trim();
   const inMatch = text.match(/(?:hotel|hotels|stay|stays|accommodation|lodging)\s+in\s+(.+)/i);
-  if (inMatch) return trimTemporalLocationSuffix(sanitizeLocationText(inMatch[1]));
+  if (inMatch) return cleanHotelCity(inMatch[1]);
   const atMatch = text.match(/(?:hotel|hotels|stay|stays|accommodation|lodging)\s+at\s+(.+)/i);
-  if (atMatch) return trimTemporalLocationSuffix(sanitizeLocationText(atMatch[1]));
+  if (atMatch) return cleanHotelCity(atMatch[1]);
   const stayingMatch = text.match(/(?:staying(?:\s+in)?|stay\s+in)\s+(.+)/i);
-  if (stayingMatch) return trimTemporalLocationSuffix(sanitizeLocationText(stayingMatch[1]));
+  if (stayingMatch) return cleanHotelCity(stayingMatch[1]);
   const nearMatch = text.match(
     /(?:hotel|hotels|stay|stays|staying|accommodation|lodging)\s+(?:near|around)\s+(.+)/i
   );
-  if (nearMatch) return trimTemporalLocationSuffix(sanitizeLocationText(nearMatch[1]));
+  if (nearMatch) return cleanHotelCity(nearMatch[1]);
   return null;
 }
 
@@ -477,13 +667,25 @@ function parseSpotLocation(message) {
   const text = (message || "").toLowerCase();
   if (text.includes("near me") || text.includes("nearby")) return null;
 
-  const generic = text.match(/\b(?:in|near|around|at|by)\s+([a-z\s'-]{2,})$/i);
-  if (generic?.[1]) return sanitizeLocationText(generic[1]);
+  const cleanSpotLocation = (value) =>
+    sanitizeLocationText(value)
+      .replace(/\b(?:open now|late night|24 hours?)\b.*$/i, "")
+      .trim();
+
+  const generic = text.match(
+    /\b(?:in|near|around|at|by)\s+([a-z\s'-]{2,})(?:\s+(?:open now|late night|24 hours?))?$/i
+  );
+  if (generic?.[1]) return cleanSpotLocation(generic[1]);
+
+  const midSentence = text.match(
+    /\b(?:in|near|around|at|by)\s+([a-z\s'-]{2,}?)(?=\s+\b(?:open now|late night|24 hours?|with|for|please|find|show|search)\b|$)/i
+  );
+  if (midSentence?.[1]) return cleanSpotLocation(midSentence[1]);
 
   const keywordTail = text.match(
     /\b(?:cafe|cafes|coffee|library|gym|restaurant|restaurants|bar|bars|park|parks|atm|pharmacy|drugstore|gas|gas station|grocery|supermarket|laundry|laundromat|museum|mall|shopping|bookstore|bakery|convenience store|hardware|electronics|clothing|shoe|furniture|department store|liquor|pet store|vet|salon|barber|spa|post office|parking|car wash|car repair|car rental|movie|theater|night club)\s+([a-z\s'-]{2,})$/i
   );
-  if (keywordTail?.[1]) return sanitizeLocationText(keywordTail[1]);
+  if (keywordTail?.[1]) return cleanSpotLocation(keywordTail[1]);
 
   return null;
 }
@@ -576,6 +778,14 @@ function stripLocationAndVerbs(message) {
   }
   text = text.replace(/\s+/g, " ").trim();
   return text;
+}
+
+function chooseDisplayLocationLabel(resolvedLabel, locationText) {
+  const resolved = String(resolvedLabel || "").trim();
+  const fallback = String(locationText || "").trim();
+  if (!resolved) return fallback || null;
+  if (/\brailway\b/i.test(resolved) && fallback) return fallback;
+  return resolved;
 }
 
 async function resolveSpotCenter({ locationText, clientLat, clientLng }) {
@@ -725,8 +935,14 @@ async function handlePlacesIntent({
 }) {
   const startedAt = Date.now();
   const modifiers = modifiersOverride || extractSpotModifiers(message);
+  const broadPlacesQuery =
+    !isRestaurantIntent && /\b(best|top)\s+places?\s+in\b/i.test(String(message || ""));
   const typeHints = inferSpotTypes(message, {
-    defaultType: isRestaurantIntent ? "restaurant" : "cafe",
+    defaultType: isRestaurantIntent
+      ? "restaurant"
+      : broadPlacesQuery
+        ? "tourist_attraction"
+        : "cafe",
   });
 
   if (!nearMe && !locationText) {
@@ -754,8 +970,8 @@ async function handlePlacesIntent({
 
   const resolved = await resolveSpotCenter({
     locationText: nearMe ? null : locationText,
-    clientLat: hasClientLocation ? clientLat : null,
-    clientLng: hasClientLocation ? clientLng : null,
+    clientLat: nearMe && hasClientLocation ? clientLat : null,
+    clientLng: nearMe && hasClientLocation ? clientLng : null,
   });
   console.log("[spots] resolve", {
     message: message?.slice(0, 80),
@@ -782,9 +998,16 @@ async function handlePlacesIntent({
   const radius = modifiers.radiusMeters || 3000;
   const rankPreference = modifiers.rank || "popularity";
   const hasOverrideQuery = String(queryOverride || "").trim().length > 0;
-  const useTextSearch = hasOverrideQuery || modifiers.lateNight || !typeHints.length;
-  const q = hasOverrideQuery ? String(queryOverride).trim() : useTextSearch ? stripLocationAndVerbs(message) : null;
+  const useTextSearch = hasOverrideQuery || modifiers.lateNight || !typeHints.length || broadPlacesQuery;
+  const q = hasOverrideQuery
+    ? String(queryOverride).trim()
+    : useTextSearch
+      ? broadPlacesQuery
+        ? `top attractions in ${locationText || ""}`.trim()
+        : stripLocationAndVerbs(message)
+      : null;
   const categoryLabel = isRestaurantIntent ? "restaurants" : "spots";
+  const displayLocation = chooseDisplayLocationLabel(resolved?.label, locationText);
 
   const fieldMask = [
     "places.id",
@@ -859,8 +1082,8 @@ async function handlePlacesIntent({
 
   const payload = {
     assistantMessage: cards.length
-      ? `Here are some ${isRestaurantIntent ? "restaurants" : "spots"} in ${resolved.label || locationText}.`
-      : `I couldn't find ${isRestaurantIntent ? "restaurants" : "spots"} in ${resolved.label || locationText} right now.`,
+      ? `Here are some ${isRestaurantIntent ? "restaurants" : "spots"} in ${displayLocation}.`
+      : `I couldn't find ${isRestaurantIntent ? "restaurants" : "spots"} in ${displayLocation} right now.`,
     cards,
     actions: [
       {
@@ -870,7 +1093,7 @@ async function handlePlacesIntent({
           tripId: resultRefId,
           tab: isRestaurantIntent ? "restaurant" : "spots",
           category: categoryLabel,
-          label: resolved.label || locationText || "Spots",
+          label: displayLocation || "Spots",
           lat: resolved.lat,
           lng: resolved.lng,
           radius,
@@ -891,7 +1114,7 @@ async function handlePlacesIntent({
       center: {
         lat: resolved.lat,
         lng: resolved.lng,
-        label: resolved.label || locationText || "Current location",
+        label: displayLocation || "Current location",
       },
       places: cards,
       markers,
@@ -1001,6 +1224,63 @@ function parseDateRangeFromText(text) {
     return date ? { startDate: date, endDate: date } : null;
   }
 
+  const relativeSingleMap = {
+    today: 0,
+    tonight: 0,
+    tomorrow: 1,
+  };
+  for (const [token, offset] of Object.entries(relativeSingleMap)) {
+    if (raw.includes(token)) {
+      const date = addDays(new Date(), offset);
+      const normalized = toDateString(date);
+      return { startDate: normalized, endDate: normalized };
+    }
+  }
+
+  const weekdayMap = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+  const weekdayMatch = raw.match(/\b(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  if (weekdayMatch) {
+    const mode = weekdayMatch[1];
+    const targetWeekday = weekdayMap[weekdayMatch[2]];
+    const now = new Date();
+    const todayWeekday = now.getUTCDay();
+    let daysAhead = (targetWeekday - todayWeekday + 7) % 7;
+    if (mode === "next") {
+      daysAhead = daysAhead === 0 ? 7 : daysAhead + 7;
+    } else if (daysAhead === 0) {
+      daysAhead = 7;
+    }
+    const start = addDays(now, daysAhead);
+    const end = addDays(start, 3);
+    return { startDate: toDateString(start), endDate: toDateString(end) };
+  }
+
+  if (raw.includes("this weekend") || raw.includes("next weekend")) {
+    const now = new Date();
+    const weekday = now.getUTCDay();
+    const daysUntilSaturday = ((6 - weekday + 7) % 7) || 7;
+    const start = addDays(now, daysUntilSaturday);
+    const end = addDays(start, 2);
+    return { startDate: toDateString(start), endDate: toDateString(end) };
+  }
+
+  if (raw.includes("next week")) {
+    const now = new Date();
+    const weekday = now.getUTCDay();
+    const daysUntilNextMonday = ((1 - weekday + 7) % 7) || 7;
+    const start = addDays(now, daysUntilNextMonday);
+    const end = addDays(start, 4);
+    return { startDate: toDateString(start), endDate: toDateString(end) };
+  }
+
   const monthRange = raw.match(
     /(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\s*(?:to|-|–)\s*(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?/
   );
@@ -1095,6 +1375,312 @@ function pickTopMatchByName(list, query) {
     }
   }
   return bestScore > 0 ? best : null;
+}
+
+function dedupeBy(list, getKey) {
+  const seen = new Set();
+  const result = [];
+  for (const item of Array.isArray(list) ? list : []) {
+    const key = getKey(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+function hashString(value) {
+  const text = String(value || "");
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function scoreAttractionCandidate(item) {
+  const rating = Number(item?.rating?.average || 0);
+  const reviewCount = Number(item?.rating?.allReviewsCount || item?.rating?.total || 0);
+  const price = Number(item?.price?.publicAmount || item?.price?.amount || 0);
+  const flagScore = Array.isArray(item?.flags)
+    ? item.flags.reduce((sum, flag) => sum + Number(flag?.rank || 0), 0)
+    : 0;
+  return rating * 40 + Math.log10(reviewCount + 1) * 18 + flagScore - price / 120;
+}
+
+function scoreHotelCandidate(item, budget = null) {
+  const reviewScore = Number(item?.reviewScore || 0);
+  const reviewCount = Number(item?.reviewCount || 0);
+  const stars = Number(item?.stars || 0);
+  const price = Number(item?.priceTotal || 0);
+
+  let pricePenalty = 0;
+  if (budget === "budget") pricePenalty = price / 45;
+  else if (budget === "luxury") pricePenalty = price / 200;
+  else pricePenalty = price / 90;
+
+  return reviewScore * 30 + Math.log10(reviewCount + 1) * 20 + stars * 8 - pricePenalty;
+}
+
+function addExplorationJitter(items, getKey, range = 0.35) {
+  return (Array.isArray(items) ? items : []).map((item) => {
+    const key = getKey(item);
+    const jitter = ((hashString(`${key}:${Date.now()}:${Math.random()}`) % 1000) / 1000 - 0.5) * range;
+    return { ...item, _plannerJitter: jitter };
+  });
+}
+
+async function fetchAttractionCandidates(locationId) {
+  if (!locationId) return [];
+
+  const pages = [1, 2, 3, 4];
+  const responses = await Promise.all(
+    pages.map((page) =>
+      searchAttractions({
+        id: locationId,
+        page,
+        currency_code: "USD",
+        languagecode: "en-us",
+        sortBy: "trending",
+      }).catch(() => null)
+    )
+  );
+
+  const merged = responses.flatMap((response) => normalizeAttractions(response)?.products || []);
+  const deduped = dedupeBy(
+    merged,
+    (item) => String(item?.slug || item?.id || item?.name || "").trim().toLowerCase()
+  );
+
+  return addExplorationJitter(deduped, (item) => item?.slug || item?.id || item?.name)
+    .sort(
+      (a, b) =>
+        scoreAttractionCandidate(b) +
+        Number(b?._plannerJitter || 0) -
+        (scoreAttractionCandidate(a) + Number(a?._plannerJitter || 0))
+    )
+    .map(({ _plannerJitter, ...item }) => item);
+}
+
+async function fetchHotelCandidates({
+  destination,
+  startDate,
+  endDate,
+  adultsCount,
+  budget,
+}) {
+  if (!destination?.dest_id || !destination?.search_type) return [];
+
+  const pages = [1, 2, 3];
+  const responses = await Promise.all(
+    pages.map((page_number) =>
+      searchHotels({
+        dest_id: destination.dest_id,
+        search_type: destination.search_type,
+        arrival_date: startDate,
+        departure_date: endDate,
+        adults: adultsCount,
+        room_qty: 1,
+        page_number,
+        currency_code: "USD",
+        languagecode: "en-us",
+      }).catch(() => null)
+    )
+  );
+
+  const merged = responses.flatMap((response) => normalizeHotelsResponse(response)?.hotels || []);
+  const deduped = dedupeBy(
+    merged,
+    (item) => String(item?.hotelId || item?.name || "").trim().toLowerCase()
+  );
+
+  return addExplorationJitter(deduped, (item) => item?.hotelId || item?.name)
+    .sort(
+      (a, b) =>
+        scoreHotelCandidate(b, budget) +
+        Number(b?._plannerJitter || 0) -
+        (scoreHotelCandidate(a, budget) + Number(a?._plannerJitter || 0))
+    )
+    .map(({ _plannerJitter, ...item }) => item);
+}
+
+async function fetchRestaurantCandidates(center) {
+  if (!center?.lat || !center?.lng) return [];
+
+  const fieldMask = [
+    "places.id",
+    "places.displayName",
+    "places.location",
+    "places.formattedAddress",
+    "places.shortFormattedAddress",
+    "places.rating",
+    "places.userRatingCount",
+    "places.photos",
+  ].join(",");
+  const queries = [
+    "restaurants",
+    "best restaurants",
+    "lunch restaurants",
+    "dinner restaurants",
+  ];
+
+  const responses = await Promise.all(
+    queries.map((textQuery) =>
+      placesSearchTextNew(
+        {
+          textQuery,
+          maxResultCount: 12,
+          locationBias: {
+            circle: {
+              center: { latitude: center.lat, longitude: center.lng },
+              radius: 9000,
+            },
+          },
+        },
+        fieldMask
+      ).catch(() => null)
+    )
+  );
+
+  const merged = responses.flatMap((response) => normalizePlacesNearby(response?.places));
+  const deduped = dedupeBy(
+    merged,
+    (item) => String(item?.placeId || item?.providerId || item?.name || "").trim().toLowerCase()
+  );
+
+  return addExplorationJitter(deduped, (item) => item?.placeId || item?.providerId || item?.name)
+    .sort(
+      (a, b) =>
+        Number(b?.rating || 0) * 20 +
+        Math.log10(Number(b?.ratingCount || 0) + 1) * 15 +
+        Number(b?._plannerJitter || 0) -
+        (Number(a?.rating || 0) * 20 +
+          Math.log10(Number(a?.ratingCount || 0) + 1) * 15 +
+          Number(a?._plannerJitter || 0))
+    )
+    .map(({ _plannerJitter, ...item }) => item);
+}
+
+function coerceFlightIntent(outlineFlightIntent, routeForFlight) {
+  const preference = ["cheapest", "best", "earliest", "latest"].includes(
+    outlineFlightIntent?.preference
+  )
+    ? outlineFlightIntent.preference
+    : "best";
+
+  return {
+    fromAirportCode: outlineFlightIntent?.fromAirportCode || null,
+    toAirportCode: outlineFlightIntent?.toAirportCode || null,
+    preference,
+    maxStops: Number.isFinite(Number(outlineFlightIntent?.maxStops))
+      ? Math.max(0, Math.min(3, Number(outlineFlightIntent.maxStops)))
+      : 1,
+    cabinClass: outlineFlightIntent?.cabinClass || null,
+    fromText: routeForFlight?.fromText || null,
+    toText: routeForFlight?.toText || null,
+  };
+}
+
+function sortRestaurantsForMeal(restaurants, mealType, anchor = null) {
+  const list = Array.isArray(restaurants) ? restaurants.slice() : [];
+  return list.sort((a, b) => {
+    const aRating = Number(a?.rating || 0);
+    const bRating = Number(b?.rating || 0);
+    const aCount = Number(a?.ratingCount || 0);
+    const bCount = Number(b?.ratingCount || 0);
+
+    if (anchor?.lat !== null && anchor?.lat !== undefined && anchor?.lng !== null && anchor?.lng !== undefined) {
+      const aDist =
+        Math.abs(Number(a?.lat ?? 999) - anchor.lat) + Math.abs(Number(a?.lng ?? 999) - anchor.lng);
+      const bDist =
+        Math.abs(Number(b?.lat ?? 999) - anchor.lat) + Math.abs(Number(b?.lng ?? 999) - anchor.lng);
+      if (aDist !== bDist) return aDist - bDist;
+    }
+
+    if (mealType === "dinner" && aCount !== bCount) return bCount - aCount;
+    if (aRating !== bRating) return bRating - aRating;
+    return bCount - aCount;
+  });
+}
+
+function pickRestaurantForMeal(restaurantPool, mealType, anchor = null) {
+  if (!Array.isArray(restaurantPool) || !restaurantPool.length) return null;
+  const ranked = sortRestaurantsForMeal(restaurantPool, mealType, anchor);
+  const chosen = ranked[0] || null;
+  if (!chosen) return null;
+  const idx = restaurantPool.findIndex(
+    (item) => (item?.placeId || item?.providerId || item?.name) === (chosen?.placeId || chosen?.providerId || chosen?.name)
+  );
+  if (idx >= 0) restaurantPool.splice(idx, 1);
+  return chosen;
+}
+
+function buildRestaurantPlanItem(restaurant, resolvedDestination, mealType) {
+  if (restaurant) {
+    return {
+      id: makePlanId(),
+      type: "restaurant",
+      kind: mealType === "lunch" ? "meal_lunch" : "meal_dinner",
+      title: restaurant.name || (mealType === "lunch" ? "Lunch" : "Dinner"),
+      subtitle: restaurant.address || resolvedDestination,
+      source: "google",
+      sourceId: restaurant.placeId || restaurant.providerId || null,
+      lat: restaurant.lat ?? null,
+      lng: restaurant.lng ?? null,
+      imageUrl: restaurant.imageUrl || null,
+      price: null,
+      rating: restaurant.rating ?? null,
+      timeWindow: mealType,
+      meta: { meal: mealType, ratingCount: restaurant.ratingCount ?? null },
+    };
+  }
+
+  return {
+    id: makePlanId(),
+    type: "restaurant",
+    kind: mealType === "lunch" ? "meal_lunch" : "meal_dinner",
+    title: mealType === "lunch" ? "Lunch" : "Dinner",
+    subtitle: resolvedDestination,
+    source: null,
+    sourceId: null,
+    lat: null,
+    lng: null,
+    imageUrl: null,
+    price: null,
+    rating: null,
+    timeWindow: mealType,
+    meta: { meal: mealType, placeholder: true },
+  };
+}
+
+function mapTimeWindowToTimeOfDay(timeWindow) {
+  if (timeWindow === "lunch") return "midday";
+  if (timeWindow === "dinner") return "evening";
+  if (timeWindow === "evening") return "evening";
+  if (timeWindow === "morning") return "morning";
+  return "afternoon";
+}
+
+function buildPlanFlightMeta(flightPreview, overrides = {}) {
+  if (!flightPreview) return null;
+  return {
+    bookingToken: flightPreview.bookingToken || null,
+    offerId: flightPreview.offerId || null,
+    airlineCode: flightPreview.airlineCode || null,
+    airlineName: flightPreview.airlineName || null,
+    airlineLogoUrl: flightPreview.airlineLogoUrl || null,
+    departTime: flightPreview.departAt || null,
+    arriveTime: flightPreview.arriveAt || null,
+    departAirportCode: flightPreview.fromLabel || null,
+    arriveAirportCode: flightPreview.toLabel || null,
+    stops: flightPreview.stops ?? null,
+    durationSec: flightPreview.durationSec ?? null,
+    fromId: flightPreview.fromId || null,
+    toId: flightPreview.toId || null,
+    fromLabel: flightPreview.fromLabel || null,
+    toLabel: flightPreview.toLabel || null,
+    ...overrides,
+  };
 }
 
 function pickAttractionCoords(details) {
@@ -1238,12 +1824,463 @@ async function createQuickTrip({ userId, primaryLocationName, startDate, endDate
       budget_tier: "midrange",
       road_trip: false,
       title,
+      planning_state: "draft",
     })
     .select("id,start_date,end_date")
     .single();
 
   if (error) throw error;
   return data;
+}
+
+async function ensurePlannerTrip({
+  authUser,
+  tripId,
+  createTripPrefs,
+  destinationLabel,
+  startDate,
+  endDate,
+}) {
+  if (tripId) {
+    const { data } = await supabaseAdmin
+      .from("trips")
+      .select("id")
+      .eq("id", tripId)
+      .eq("user_id", authUser.id)
+      .single();
+    if (data?.id) return data.id;
+  }
+
+  if (!createTripPrefs?.destination && !destinationLabel) return null;
+
+  const tripTitle = [
+    createTripPrefs?.destination || destinationLabel || "Trip",
+    startDate && endDate ? `${startDate}–${endDate}` : null,
+  ]
+    .filter(Boolean)
+    .join(" • ");
+
+  const { data, error } = await supabaseAdmin
+    .from("trips")
+    .insert({
+      user_id: authUser.id,
+      primary_location_name: createTripPrefs?.destination || destinationLabel,
+      primary_location_place_id: createTripPrefs?.destinationPlaceId || null,
+      start_date: startDate,
+      end_date: endDate,
+      travelers: createTripPrefs?.travelers || deriveAdultCount(createTripPrefs, 1),
+      budget_tier: createTripPrefs?.budget || "midrange",
+      road_trip: Boolean(createTripPrefs?.roadTrip),
+      title: tripTitle || `${createTripPrefs?.destination || destinationLabel} Trip`,
+      planning_state: "draft",
+    })
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  return data?.id || null;
+}
+
+async function ensurePlannerTripForMessage({
+  authUser,
+  tripId,
+  createTripPrefs,
+  destinationLabel,
+  startDate,
+  endDate,
+}) {
+  if (tripId) return tripId;
+  const resolvedDestination = createTripPrefs?.destination || destinationLabel || null;
+  if (!resolvedDestination || !startDate || !endDate) return null;
+  return ensurePlannerTrip({
+    authUser,
+    tripId,
+    createTripPrefs: createTripPrefs || { destination: resolvedDestination },
+    destinationLabel: resolvedDestination,
+    startDate,
+    endDate,
+  });
+}
+
+function getAssistantThreadId(input = {}) {
+  const raw =
+    input.threadId ||
+    input.thread_id ||
+    input.workspaceId ||
+    input.tripId ||
+    input.trip_id ||
+    null;
+  return raw ? String(raw) : "default";
+}
+
+function getTripDraftCacheKey(authUser, threadId) {
+  return `assistant:trip_draft:${authUser?.id || "anon"}:${threadId || "default"}`;
+}
+
+function getTripDraft(authUser, threadId) {
+  return cacheGet(getTripDraftCacheKey(authUser, threadId)) || null;
+}
+
+function setTripDraft(authUser, threadId, draft) {
+  cacheSet(getTripDraftCacheKey(authUser, threadId), draft, 1000 * 60 * 60 * 24);
+  return draft;
+}
+
+async function loadTripDraft(authUser, threadId) {
+  const cached = getTripDraft(authUser, threadId);
+  if (cached) return cached;
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("assistant_trip_drafts")
+      .select("draft_json")
+      .eq("user_id", authUser.id)
+      .eq("thread_id", threadId)
+      .maybeSingle();
+
+    if (error) throw error;
+    const draft = data?.draft_json || null;
+    if (draft) setTripDraft(authUser, threadId, draft);
+    return draft;
+  } catch {
+    return null;
+  }
+}
+
+async function loadLatestTripDraftByTripId(authUser, tripId) {
+  const normalizedTripId = String(tripId || "").trim();
+  if (!normalizedTripId) return null;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("assistant_trip_drafts")
+      .select("thread_id,draft_json,updated_at")
+      .eq("user_id", authUser.id)
+      .eq("trip_id", normalizedTripId)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    const draft = data?.draft_json || null;
+    if (draft && data?.thread_id) setTripDraft(authUser, data.thread_id, draft);
+    return draft;
+  } catch {
+    return null;
+  }
+}
+
+async function persistTripDraft(authUser, threadId, draft) {
+  setTripDraft(authUser, threadId, draft);
+  try {
+    await supabaseAdmin.from("assistant_trip_drafts").upsert(
+      {
+        user_id: authUser.id,
+        thread_id: threadId,
+        trip_id: draft?.tripId || null,
+        draft_json: draft,
+      },
+      { onConflict: "user_id,thread_id" }
+    );
+  } catch {
+    // Cache remains the fallback if storage is temporarily unavailable.
+  }
+  return draft;
+}
+
+function nextDefaultDateRange() {
+  const now = new Date();
+  const weekday = now.getUTCDay();
+  const daysUntilFriday = ((5 - weekday + 7) % 7) || 7;
+  const start = addDays(now, daysUntilFriday);
+  const end = addDays(start, 3);
+  return {
+    startDate: toDateString(start),
+    endDate: toDateString(end),
+  };
+}
+
+function normalizeBudgetTier(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (["budget", "cheap", "low"].includes(text)) return "budget";
+  if (["luxury", "premium", "high"].includes(text)) return "luxury";
+  return "mid";
+}
+
+function normalizeVibes(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
+  return String(value)
+    .split(/[,\s]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function buildEntityRefId(prefix, item) {
+  return `${prefix}_${String(item?.sourceId || item?.placeId || item?.providerId || item?.id || item?.name || makePlanId())
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .slice(0, 48)}`;
+}
+
+function averageCoords(items) {
+  const valid = (Array.isArray(items) ? items : []).filter(
+    (item) => Number.isFinite(Number(item?.lat)) && Number.isFinite(Number(item?.lng))
+  );
+  if (!valid.length) return null;
+  const lat = valid.reduce((sum, item) => sum + Number(item.lat), 0) / valid.length;
+  const lng = valid.reduce((sum, item) => sum + Number(item.lng), 0) / valid.length;
+  return { lat, lng };
+}
+
+function clusterKeyForCoords(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "fallback";
+  return `${Math.round(lat * 20) / 20}:${Math.round(lng * 20) / 20}`;
+}
+
+function clusterAttractionsByNeighborhood(attractions, anchor = null) {
+  const buckets = new Map();
+  for (const attraction of Array.isArray(attractions) ? attractions : []) {
+    const lat = Number(attraction?.location?.lat);
+    const lng = Number(attraction?.location?.lng);
+    const key = clusterKeyForCoords(lat, lng);
+    const bucket = buckets.get(key) || {
+      key,
+      center: { lat: Number.isFinite(lat) ? lat : null, lng: Number.isFinite(lng) ? lng : null },
+      items: [],
+    };
+    bucket.items.push(attraction);
+    buckets.set(key, bucket);
+  }
+
+  const clusters = [...buckets.values()].sort((a, b) => b.items.length - a.items.length);
+  if (!anchor?.lat || !anchor?.lng) return clusters;
+
+  return clusters.sort((a, b) => {
+    const aDist =
+      Math.abs(Number(a?.center?.lat ?? 999) - Number(anchor.lat)) +
+      Math.abs(Number(a?.center?.lng ?? 999) - Number(anchor.lng));
+    const bDist =
+      Math.abs(Number(b?.center?.lat ?? 999) - Number(anchor.lat)) +
+      Math.abs(Number(b?.center?.lng ?? 999) - Number(anchor.lng));
+    if (aDist !== bDist) return aDist - bDist;
+    return (b?.items?.length || 0) - (a?.items?.length || 0);
+  });
+}
+
+function getClusterPlanForDay(clusters, dayIndex) {
+  const list = Array.isArray(clusters) ? clusters : [];
+  if (!list.length) return [];
+  if (list.length === 1) return [list[0].key];
+  const first = list[dayIndex % list.length]?.key;
+  const second = list[(dayIndex + 1) % list.length]?.key;
+  return dedupeBy([first, second].filter(Boolean), (item) => item);
+}
+
+function filterNovelItems(list, usedIds, getId, minKeep = 12) {
+  const blocked = new Set(Array.isArray(usedIds) ? usedIds : []);
+  const fresh = (Array.isArray(list) ? list : []).filter((item) => !blocked.has(getId(item)));
+  if (fresh.length >= minKeep) return fresh;
+  return Array.isArray(list) ? list : [];
+}
+
+function scoreFlightCandidateForDraft(offer) {
+  const price = Number(offer?.price?.total ?? 999999);
+  const durationSec = Number(offer?.durationSec ?? 999999);
+  const stops = Number(offer?.stops ?? 3);
+  const arriveMinutes = parseTimeToMinutes(offer?.arrive?.time);
+  const badRedEyePenalty =
+    Number.isFinite(arriveMinutes) && arriveMinutes >= 0 && arriveMinutes < 5 * 60 ? 120 : 0;
+  return price * 0.35 + durationSec / 60 * 0.30 + stops * 120 * 0.20 + badRedEyePenalty * 0.15;
+}
+
+function pickFlightBundle(shortlist) {
+  const ranked = (Array.isArray(shortlist) ? shortlist : []).slice().sort(
+    (a, b) => scoreFlightCandidateForDraft(a) - scoreFlightCandidateForDraft(b)
+  );
+  return {
+    selected: ranked[0] || null,
+    alternates: ranked.slice(1, 5),
+  };
+}
+
+function buildFlightCardSelection(selectedOffer, fromLoc, toLoc) {
+  if (!selectedOffer) return null;
+  return {
+    provider: "booking_flights",
+    offer_id: selectedOffer.id || selectedOffer.token || null,
+    booking_token: selectedOffer.token || null,
+    origin: selectedOffer.depart?.airportCode || fromLoc?.code || fromLoc?.label || null,
+    destination: selectedOffer.arrive?.airportCode || toLoc?.code || toLoc?.label || null,
+    depart_at: selectedOffer.depart?.time || null,
+    arrive_at: selectedOffer.arrive?.time || null,
+    stops: selectedOffer.stops ?? null,
+    duration_minutes: selectedOffer.durationSec ? Math.round(selectedOffer.durationSec / 60) : null,
+    price: selectedOffer.price?.total !== undefined && selectedOffer.price?.total !== null
+      ? { amount: selectedOffer.price.total, currency: selectedOffer.price.currency || "USD" }
+      : null,
+    airline: selectedOffer.airlineName || selectedOffer.airlineCode || null,
+  };
+}
+
+function buildTripDraftActions({ tripId, date, threadId }) {
+  const base = { trip_id: tripId || null, thread_id: threadId || null };
+  return [
+    {
+      id: "swap_flight",
+      label: "Swap flight",
+      style: "primary",
+      endpoint: "/api/assistant/actions/swap-flight",
+      method: "POST",
+      payload: base,
+    },
+    {
+      id: "swap_hotel",
+      label: "Swap hotel",
+      style: "secondary",
+      endpoint: "/api/assistant/actions/swap-hotel",
+      method: "POST",
+      payload: base,
+    },
+    {
+      id: "cheaper_options",
+      label: "Cheaper options",
+      style: "secondary",
+      endpoint: "/api/assistant/actions/tune",
+      method: "POST",
+      payload: { ...base, budget_tier: "budget" },
+    },
+    {
+      id: "more_premium",
+      label: "More premium",
+      style: "secondary",
+      endpoint: "/api/assistant/actions/tune",
+      method: "POST",
+      payload: { ...base, budget_tier: "luxury" },
+    },
+    {
+      id: "more_attractions",
+      label: "More attractions",
+      style: "ghost",
+      endpoint: "/api/assistant/actions/more-attractions",
+      method: "POST",
+      payload: { ...base, count: 10 },
+    },
+    {
+      id: "regen_day",
+      label: "Regenerate Day",
+      style: "secondary",
+      endpoint: "/api/assistant/actions/regenerate-day",
+      method: "POST",
+      payload: { ...base, date: date || null },
+    },
+    {
+      id: "lock_plan",
+      label: "Lock this plan",
+      style: "primary",
+      endpoint: "/api/assistant/actions/lock-plan",
+      method: "POST",
+      payload: base,
+    },
+    {
+      id: "add_day_trip",
+      label: "Add a day trip",
+      style: "ghost",
+      endpoint: "/api/assistant/actions/tune",
+      method: "POST",
+      payload: { ...base, vibe_add: ["day_trip"] },
+    },
+    {
+      id: "view_full_plan",
+      label: "View full plan",
+      style: "primary",
+      ui: { open: "bottom_sheet", target: "trip_plan" },
+    },
+  ];
+}
+
+function buildTripDraftResponse(draft, extraCards = []) {
+  const firstUnlockedDay = Array.isArray(draft?.plan?.days)
+    ? draft.plan.days.find((day) => !draft?.locks?.locked_days?.includes(day?.date))
+    : null;
+
+  return {
+    type: "assistant_response",
+    thread_id: draft?.threadId || null,
+    trip_id: draft?.tripId || null,
+    message:
+      draft?.message ||
+      `I built a realistic ${draft?.plan?.days?.length || 0}-day ${draft?.destinationLabel || "trip"} plan around your flights.`,
+    cards: [
+      {
+        type: "trip_overview",
+        trip_name: draft?.plan?.title || `Trip to ${draft?.destinationLabel || "your destination"}`,
+        destination: { city: draft?.destinationLabel || null, country: null },
+        dates: { start: draft?.startDate || null, end: draft?.endDate || null },
+        travelers: {
+          adults: draft?.travelers?.adults || 1,
+          children: draft?.travelers?.children || 0,
+        },
+        budget_tier: draft?.budgetTier || "mid",
+        vibes: draft?.vibes || [],
+        status: { needs_confirmation: Boolean(draft?.needsConfirmation) },
+      },
+      {
+        type: "flight_card",
+        selected: draft?.selectedFlight || null,
+        alternates: draft?.flightAlternates || [],
+        lock_state: { locked: Boolean(draft?.locks?.flight) },
+      },
+      {
+        type: "hotel_card",
+        selected: draft?.selectedHotel || null,
+        alternates: draft?.hotelAlternates || [],
+        lock_state: { locked: Boolean(draft?.locks?.hotel) },
+      },
+      {
+        type: "itinerary_card",
+        days: (draft?.plan?.days || []).map((day) => ({
+          date: day?.date || null,
+          title: day?.theme || day?.label || null,
+          time_blocks: (day?.items || []).map((item) => ({
+            start: String(item?.startTime || "").split("T")[1]?.slice(0, 5) || null,
+            end: String(item?.endTime || "").split("T")[1]?.slice(0, 5) || null,
+            kind: item?.kind || item?.type || "activity",
+            title: item?.title || null,
+            image_url: item?.imageUrl || null,
+            ref_id:
+              item?.type === "attraction"
+                ? buildEntityRefId("a", item)
+                : item?.type === "restaurant"
+                  ? buildEntityRefId("r", item)
+                  : item?.type === "hotel"
+                    ? buildEntityRefId("h", item)
+                    : null,
+          })),
+        })),
+        locks: { locked_days: draft?.locks?.locked_days || [] },
+      },
+      ...extraCards,
+    ],
+    entities: {
+      attractions: draft?.entities?.attractions || [],
+      restaurants: draft?.entities?.restaurants || [],
+      hotels: draft?.entities?.hotels || [],
+    },
+    actions: buildTripDraftActions({
+      tripId: draft?.tripId,
+      threadId: draft?.threadId,
+      date: firstUnlockedDay?.date || draft?.startDate || null,
+    }),
+    ui: {
+      suggested_quick_replies: [
+        "Cheaper options",
+        "More nightlife",
+        "More museums",
+        "Make it walkable",
+        "Add a day trip",
+      ],
+    },
+    debug: draft?.debug || null,
+  };
 }
 
 function getDepartureTimeWindowOk(departureAt, timeWindow) {
@@ -1363,6 +2400,85 @@ async function resolveIataCode(keyword) {
   return loc?.id ? loc : null;
 }
 
+async function resolveDepartureAirportFromCoords(clientLat, clientLng) {
+  if (!Number.isFinite(clientLat) || !Number.isFinite(clientLng)) return null;
+
+  const fieldMask = [
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.shortFormattedAddress",
+  ].join(",");
+
+  try {
+    const nearby = await placesNearbySearchNew(
+      {
+        locationRestriction: {
+          circle: {
+            center: { latitude: clientLat, longitude: clientLng },
+            radius: 120000,
+          },
+        },
+        includedTypes: ["airport"],
+        maxResultCount: 5,
+        rankPreference: "DISTANCE",
+      },
+      fieldMask
+    );
+
+    const places = Array.isArray(nearby?.places) ? nearby.places : [];
+    for (const place of places) {
+      const terms = [
+        place?.displayName?.text,
+        place?.shortFormattedAddress,
+        place?.formattedAddress,
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
+
+      for (const term of terms) {
+        const resolved = await resolveIataCode(term);
+        if (resolved?.id) return resolved;
+      }
+    }
+  } catch {}
+
+  try {
+    const text = await placesSearchTextNew(
+      {
+        textQuery: "airport",
+        maxResultCount: 5,
+        rankPreference: "DISTANCE",
+        locationBias: {
+          circle: {
+            center: { latitude: clientLat, longitude: clientLng },
+            radius: 120000,
+          },
+        },
+      },
+      fieldMask
+    );
+
+    const places = Array.isArray(text?.places) ? text.places : [];
+    for (const place of places) {
+      const terms = [
+        place?.displayName?.text,
+        place?.shortFormattedAddress,
+        place?.formattedAddress,
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
+
+      for (const term of terms) {
+        const resolved = await resolveIataCode(term);
+        if (resolved?.id) return resolved;
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 async function resolveHotelDestination(keyword) {
   const list = await searchHotelDestination({ query: keyword, languagecode: "en-us" });
   const first = Array.isArray(list) ? list[0] : null;
@@ -1413,6 +2529,7 @@ async function buildTripPlanFromPrompt({
   overrides = {},
 }) {
   const startedAt = Date.now();
+  const existingDraft = overrides?.existingDraft || null;
   const parsedRouteForPlan = parseOriginDestinationForPlan(promptText) || parseRoute(promptText);
   const destinationLabel =
     overrides.destinationLabel ||
@@ -1447,12 +2564,13 @@ async function buildTripPlanFromPrompt({
   let endDate = normalizeDateInput(
     overrides.endDate || parsedDates?.endDate || outline?.endDate
   );
+  let needsConfirmation = false;
 
   if (!startDate || !endDate) {
-    return {
-      error: "missing_dates",
-      assistantMessage: "What dates should I plan for?",
-    };
+    const fallbackRange = nextDefaultDateRange();
+    startDate = startDate || fallbackRange.startDate;
+    endDate = endDate || fallbackRange.endDate;
+    needsConfirmation = true;
   }
 
   if (new Date(endDate) < new Date(startDate)) {
@@ -1478,6 +2596,23 @@ async function buildTripPlanFromPrompt({
   }
 
   if (!resolvedTripId) {
+    try {
+      resolvedTripId = await ensurePlannerTripForMessage({
+        authUser,
+        tripId: null,
+        createTripPrefs: overrides?.userPrefs || null,
+        destinationLabel: resolvedDestination,
+        startDate,
+        endDate,
+      });
+    } catch (err) {
+      return {
+        error: err?.message || "Failed to create trip",
+      };
+    }
+  }
+
+  if (!resolvedTripId) {
     return {
       error: "trip_required",
       assistantMessage: "Use Create a Trip to save a full itinerary. I can still help with flights, stays, and things to do here.",
@@ -1490,41 +2625,50 @@ async function buildTripPlanFromPrompt({
     clientLng: null,
   });
   const outlineDays = Array.isArray(outline?.days) ? outline.days.slice(0, dayCount) : [];
-  if (!outlineDays.length) {
-    outlineDays.push({
+  const normalizedOutlineDays = outlineDays.map((day) => ({
+    label: day?.label || null,
+    theme: day?.theme || null,
+    dayStartTime: day?.dayStartTime || SCHEDULE_DEFAULTS.dayStartTime,
+    dayEndTime: day?.dayEndTime || SCHEDULE_DEFAULTS.dayEndTime,
+    maxActivities: Number.isFinite(Number(day?.maxActivities))
+      ? Math.max(1, Math.min(6, Number(day.maxActivities)))
+      : 3,
+    items: Array.isArray(day?.items) ? day.items : [],
+  }));
+  if (!normalizedOutlineDays.length) {
+    normalizedOutlineDays.push({
       label: null,
       theme: null,
-      items: [
-        {
-          type: "note",
-          title: `Explore ${resolvedDestination}`,
-          timeOfDay: null,
-          query: null,
-          sourcePreference: null,
-        },
-      ],
+      dayStartTime: SCHEDULE_DEFAULTS.dayStartTime,
+      dayEndTime: SCHEDULE_DEFAULTS.dayEndTime,
+      maxActivities: 3,
+      items: [],
     });
   }
 
+  const routeForFlight = parsedRouteForPlan || parseRoute(promptText);
+  const flightIntent = coerceFlightIntent(outline?.flightIntent, routeForFlight);
+  const clientLat = Number(overrides?.clientLat);
+  const clientLng = Number(overrides?.clientLng);
+  const hasClientCoords =
+    Number.isFinite(clientLat) &&
+    Number.isFinite(clientLng) &&
+    !(clientLat === 0 && clientLng === 0);
+
   const needAttractions = !overrides?.userPrefs?.roadTrip;
   const needHotel = true;
+  const usedIds = existingDraft?.usedIds || {};
 
   let attractionLocation = null;
   let attractionsList = [];
   let hotelResult = null;
+  let hotelCandidates = [];
   const attractionPromise = needAttractions
     ? (async () => {
         try {
           attractionLocation = await resolveAttractionLocation(resolvedDestination);
           if (attractionLocation?.id) {
-            const searchData = await searchAttractions({
-              id: attractionLocation.id,
-              page: 1,
-              currency_code: "USD",
-              languagecode: "en-us",
-              sortBy: "trending",
-            });
-            attractionsList = normalizeAttractions(searchData)?.products || [];
+            attractionsList = await fetchAttractionCandidates(attractionLocation.id);
           }
         } catch {
           attractionsList = [];
@@ -1536,23 +2680,23 @@ async function buildTripPlanFromPrompt({
     ? (async () => {
         try {
           const destination = await resolveHotelDestination(resolvedDestination);
-          if (destination?.dest_id && destination?.search_type) {
-            const hotelData = await searchHotels({
-              dest_id: destination.dest_id,
-              search_type: destination.search_type,
-              arrival_date: startDate,
-              departure_date: endDate,
-              adults: adultsCount,
-              room_qty: 1,
-              page_number: 1,
-              currency_code: "USD",
-              languagecode: "en-us",
-            });
-            const normalized = normalizeHotelsResponse(hotelData);
-            hotelResult = normalized?.hotels?.[0] || null;
-          }
+          const hotels = await fetchHotelCandidates({
+            destination,
+            startDate,
+            endDate,
+            adultsCount,
+            budget: overrides?.userPrefs?.budget || null,
+          });
+          hotelCandidates = filterNovelItems(
+            hotels,
+            usedIds.hotels,
+            (item) => String(item?.hotelId || item?.name || ""),
+            8
+          );
+          hotelResult = hotelCandidates[0] || hotels[0] || null;
         } catch {
           hotelResult = null;
+          hotelCandidates = [];
         }
       })()
     : Promise.resolve();
@@ -1561,45 +2705,48 @@ async function buildTripPlanFromPrompt({
 
   let restaurantsList = [];
   try {
-    if (center?.lat && center?.lng) {
-      const fieldMask = [
-        "places.id",
-        "places.displayName",
-        "places.location",
-        "places.formattedAddress",
-        "places.shortFormattedAddress",
-        "places.rating",
-        "places.userRatingCount",
-        "places.photos",
-      ].join(",");
-      const data = await placesSearchTextNew(
-        {
-          textQuery: "restaurants",
-          maxResultCount: 12,
-          locationBias: {
-            circle: {
-              center: { latitude: center.lat, longitude: center.lng },
-              radius: 6000,
-            },
-          },
-        },
-        fieldMask
-      );
-      restaurantsList = normalizePlacesNearby(data?.places);
-    }
+    restaurantsList = await fetchRestaurantCandidates(center);
   } catch {
     restaurantsList = [];
   }
 
+  attractionsList = filterNovelItems(
+    attractionsList,
+    usedIds.attractions,
+    (item) => String(item?.slug || item?.id || item?.name || ""),
+    18
+  );
+  restaurantsList = filterNovelItems(
+    restaurantsList,
+    usedIds.restaurants,
+    (item) => String(item?.placeId || item?.providerId || item?.name || ""),
+    12
+  );
+
   let flightPreview = null;
-  const routeForFlight = parsedRouteForPlan || parseRoute(promptText);
-  if (routeForFlight?.fromText && routeForFlight?.toText) {
+  let flightBundle = { selected: null, alternates: [] };
+  let resolvedFlightFrom = null;
+  let resolvedFlightTo = null;
+  const inferredOrigin =
+    !flightIntent?.fromText && !flightIntent?.fromAirportCode && hasClientCoords
+      ? await resolveDepartureAirportFromCoords(clientLat, clientLng)
+      : null;
+  const originLookup = flightIntent?.fromAirportCode || flightIntent?.fromText || inferredOrigin?.id || inferredOrigin?.code || inferredOrigin?.label || null;
+  const destinationLookup =
+    flightIntent?.toAirportCode ||
+    flightIntent?.toText ||
+    resolvedDestination ||
+    null;
+
+  if (originLookup && destinationLookup) {
     try {
       const [fromLoc, toLoc] = await Promise.all([
-        resolveIataCode(routeForFlight.fromText),
-        resolveIataCode(routeForFlight.toText),
+        resolveIataCode(originLookup),
+        resolveIataCode(destinationLookup),
       ]);
       if (fromLoc?.id && toLoc?.id) {
+        resolvedFlightFrom = fromLoc;
+        resolvedFlightTo = toLoc;
         const cacheKey = `planFlights:${fromLoc.id}:${toLoc.id}:${startDate}:${endDate}`;
         let response = cacheGet(cacheKey);
         if (!response) {
@@ -1609,25 +2756,26 @@ async function buildTripPlanFromPrompt({
             departDate: startDate,
             returnDate: endDate,
             adults: adultsCount,
+            cabinClass: flightIntent?.cabinClass || "ECONOMY",
             currencyCode: "USD",
           });
           cacheSet(cacheKey, response, 1000 * 60 * 10);
         }
 
-        const offers = Array.isArray(response?.flightOffers)
+        const offersRaw = Array.isArray(response?.flightOffers)
           ? response.flightOffers
           : Array.isArray(response?.offers)
             ? response.offers
             : Array.isArray(response?.results)
               ? response.results
               : [];
-        const offer = offers[0];
-        if (offer) {
+        const shortlist = shortlistFlightOffers(offersRaw, flightIntent, 8);
+        flightBundle = pickFlightBundle(shortlist);
+        const selectedOffer = flightBundle.selected || null;
+        if (selectedOffer) {
+          const offer = selectedOffer.raw || {};
           const segments =
-            offer?.segments ||
-            offer?.legs?.[0]?.segments ||
-            offer?.itinerary?.segments ||
-            [];
+            offer?.segments || offer?.legs?.[0]?.segments || offer?.itinerary?.segments || [];
           const firstSegment = segments[0] || {};
           const lastSegment = segments[segments.length - 1] || {};
           const returnSegments =
@@ -1636,38 +2784,33 @@ async function buildTripPlanFromPrompt({
             [];
           const returnFirst = returnSegments[0] || {};
           const returnLast = returnSegments[returnSegments.length - 1] || {};
-          const priceObj =
-            offer?.price?.total ||
-            offer?.price?.grandTotal ||
-            offer?.price?.amount ||
-            offer?.totalPrice ||
-            offer?.total;
-          const price =
-            typeof priceObj === "number"
-              ? priceObj
-              : typeof priceObj?.amount === "number"
-                ? priceObj.amount
-                : typeof priceObj?.units === "number"
-                  ? Number(priceObj.units) + Number(priceObj.nanos || 0) / 1e9
-                  : null;
           flightPreview = {
             title: `Flight: ${fromLoc.code || fromLoc.label} → ${toLoc.code || toLoc.label}`,
-            subtitle: `${firstSegment?.departure?.at || firstSegment?.departureTime || ""} • ${
-              lastSegment?.arrival?.at || lastSegment?.arrivalTime || ""
-            }`,
+            subtitle: buildFlightSubtitle(selectedOffer),
             price:
-              price !== null
-                ? { amount: price, currency: priceObj?.currencyCode || priceObj?.currency || "USD" }
+              selectedOffer?.price?.total !== null && selectedOffer?.price?.total !== undefined
+                ? {
+                    amount: selectedOffer.price.total,
+                    currency: selectedOffer.price.currency || "USD",
+                  }
                 : null,
             raw: offer,
             fromId: fromLoc.id,
             toId: toLoc.id,
             fromLabel: fromLoc.code || fromLoc.label,
             toLabel: toLoc.code || toLoc.label,
-            departAt: firstSegment?.departure?.at || firstSegment?.departureTime || null,
-            arriveAt: lastSegment?.arrival?.at || lastSegment?.arrivalTime || null,
+            offerId: selectedOffer.id || null,
+            bookingToken: selectedOffer.token || null,
+            airlineCode: selectedOffer.airlineCode || null,
+            airlineName: selectedOffer.airlineName || null,
+            airlineLogoUrl: selectedOffer.airlineLogoUrl || null,
+            durationSec: selectedOffer.durationSec ?? null,
+            stops: selectedOffer.stops ?? null,
+            departAt: selectedOffer.depart?.time || firstSegment?.departure?.at || firstSegment?.departureTime || null,
+            arriveAt: selectedOffer.arrive?.time || lastSegment?.arrival?.at || lastSegment?.arrivalTime || null,
             returnDepartAt: returnFirst?.departure?.at || returnFirst?.departureTime || null,
             returnArriveAt: returnLast?.arrival?.at || returnLast?.arrivalTime || null,
+            shortlist,
           };
         }
       }
@@ -1677,28 +2820,22 @@ async function buildTripPlanFromPrompt({
   }
 
   const planDays = [];
-  const usedIds = new Set();
-  const usedTitles = new Set();
   const attractionPool = [...attractionsList];
   const restaurantPool = [...restaurantsList];
+  const attractionClusters = clusterAttractionsByNeighborhood(
+    attractionsList,
+    hotelResult?.lat && hotelResult?.lng
+      ? { lat: hotelResult.lat, lng: hotelResult.lng }
+      : center
+  );
   const placeLookupCache = new Map();
-
-  const addUniqueItem = (list, item) => {
-    if (!item) return;
-    const titleKey = normalizeTitleKey(item.title);
-    const idKey = item.sourceId ? `${item.source}:${item.sourceId}` : null;
-    if (idKey && usedIds.has(idKey)) return;
-    if (titleKey && usedTitles.has(titleKey)) return;
-    if (idKey) usedIds.add(idKey);
-    if (titleKey) usedTitles.add(titleKey);
-    list.push(item);
-  };
-
-  const hotelCheckinTime = 15 * 60;
-  const arrivalMinutes = parseTimeToMinutes(flightPreview?.arriveAt);
-  const returnDepartMinutes = parseTimeToMinutes(flightPreview?.returnDepartAt);
   const hasReturnFlight =
     Boolean(flightPreview?.returnDepartAt) || Boolean(flightPreview?.returnArriveAt);
+  const usedPlanKeys = new Set();
+  const arrivalMinutes = parseTimeToMinutes(flightPreview?.arriveAt);
+  const departureMinutes = parseTimeToMinutes(
+    flightPreview?.returnDepartAt || flightPreview?.departAt
+  );
 
   const findPlaceOnce = async (textQuery) => {
     const key = normalizeTitleKey(textQuery);
@@ -1735,176 +2872,184 @@ async function buildTripPlanFromPrompt({
     }
   };
 
+  const pickClusteredAttraction = (dayIndex, query = null) => {
+    const clusterKeys = getClusterPlanForDay(attractionClusters, dayIndex);
+    if (query) {
+      const withinClusters = attractionPool.filter((item) =>
+        clusterKeys.includes(clusterKeyForCoords(Number(item?.location?.lat), Number(item?.location?.lng)))
+      );
+      const matched = pickTopMatchByName(withinClusters, query) || pickTopMatchByName(attractionPool, query);
+      if (matched) {
+        const idx = attractionPool.findIndex(
+          (candidate) => String(candidate?.slug || candidate?.id || "") === String(matched?.slug || matched?.id || "")
+        );
+        if (idx >= 0) attractionPool.splice(idx, 1);
+        return matched;
+      }
+    }
+
+    const idx = attractionPool.findIndex((item) =>
+      clusterKeys.includes(clusterKeyForCoords(Number(item?.location?.lat), Number(item?.location?.lng)))
+    );
+    if (idx >= 0) {
+      return attractionPool.splice(idx, 1)[0] || null;
+    }
+    return attractionPool.shift() || null;
+  };
+
   for (let i = 0; i < dayCount; i += 1) {
     const date = toDateString(addDays(new Date(startDate), i));
-    const outlineDay = outlineDays[i] || outlineDays[outlineDays.length - 1] || null;
-    const sections = [];
+    const outlineDay = normalizedOutlineDays[i] || normalizedOutlineDays[normalizedOutlineDays.length - 1] || null;
+    const outlineItems = Array.isArray(outlineDay?.items) ? outlineDay.items : [];
+    const dayItems = [];
+    const daySeen = new Set();
+    const firstDayStartTime =
+      i === 0 && Number.isFinite(arrivalMinutes)
+        ? minutesToClock(
+            Math.max(
+              parseTimeToMinutes(SCHEDULE_DEFAULTS.dayStartTime) || 540,
+              arrivalMinutes + 90
+            )
+          )
+        : outlineDay?.dayStartTime || SCHEDULE_DEFAULTS.dayStartTime;
+    const lastDayEndTime =
+      i === dayCount - 1 && Number.isFinite(departureMinutes)
+        ? minutesToClock(
+            Math.max(
+              parseTimeToMinutes(SCHEDULE_DEFAULTS.dayStartTime) || 540,
+              departureMinutes - 120
+            )
+          )
+        : outlineDay?.dayEndTime || SCHEDULE_DEFAULTS.dayEndTime;
+
+    const pushDayItem = (item) => {
+      if (!item) return;
+      const key = `${item.kind || item.type}:${item.source || "na"}:${item.sourceId || normalizeTitleKey(item.title)}`;
+      if (daySeen.has(key)) return;
+      if (
+        item.type === "attraction" ||
+        item.type === "place" ||
+        item.type === "restaurant" ||
+        item.kind === "activity"
+      ) {
+        if (usedPlanKeys.has(key)) return;
+        usedPlanKeys.add(key);
+      }
+      daySeen.add(key);
+      dayItems.push(item);
+    };
 
     if (i === 0 && flightPreview) {
-      const arrivalItems = [];
-      addUniqueItem(arrivalItems, {
+      pushDayItem({
         id: makePlanId(),
         type: "flight",
         kind: "arrival_flight",
         title: flightPreview.title,
         subtitle: flightPreview.subtitle,
+        timeWindow: "morning",
         timeOfDay: "morning",
+        startTime: flightPreview.departAt || null,
+        endTime: flightPreview.arriveAt || null,
         source: "booking_flights",
-        sourceId: null,
+        sourceId: flightPreview.offerId || flightPreview.bookingToken || null,
         lat: null,
         lng: null,
         imageUrl: null,
         price: flightPreview.price,
         rating: null,
-        meta: flightPreview,
+        durationMin: flightPreview.durationSec ? Math.max(30, Math.round(flightPreview.durationSec / 60)) : null,
+        meta: buildPlanFlightMeta(flightPreview),
       });
-      sections.push({ type: "arrival", label: "Arrive", items: arrivalItems });
+    } else if (i === 0 && !overrides?.userPrefs?.roadTrip) {
+      pushDayItem({
+        id: makePlanId(),
+        type: "flight",
+        kind: "arrival_flight",
+        title: `Flight to ${resolvedDestination}`,
+        subtitle: "Add your departure airport to lock a real flight option.",
+        timeWindow: "morning",
+        timeOfDay: "morning",
+        startTime: `${date}T09:00:00`,
+        endTime: `${date}T11:00:00`,
+        source: null,
+        sourceId: null,
+        lat: null,
+        lng: null,
+        imageUrl: null,
+        price: null,
+        rating: null,
+        durationMin: 120,
+        meta: { placeholder: true },
+      });
     }
 
     if (i === 0) {
-      const checkinItems = [];
-      if (hotelResult?.hotelId) {
-        addUniqueItem(checkinItems, {
-          id: makePlanId(),
-          type: "hotel",
-          kind: "hotel_checkin",
-          title: hotelResult.name || "Hotel check-in",
-          subtitle: resolvedDestination,
-          timeOfDay: "afternoon",
-          source: "booking_hotels",
-          sourceId: String(hotelResult.hotelId),
-          lat: hotelResult.lat ?? null,
-          lng: hotelResult.lng ?? null,
-          imageUrl: hotelResult.imageUrl || null,
-          price: hotelResult.priceTotal
-            ? { amount: hotelResult.priceTotal, currency: hotelResult.currency || "USD" }
-            : null,
-          rating: hotelResult.reviewScore ?? null,
-          meta: { checkinTime: "3:00 PM" },
-        });
-      } else {
-        addUniqueItem(checkinItems, {
-          id: makePlanId(),
-          type: "note",
-          kind: "hotel_checkin",
-          title: `Check-in near ${resolvedDestination}`,
-          subtitle: "Check-in around 3:00 PM",
-          timeOfDay: "afternoon",
-          source: null,
-          sourceId: null,
-          lat: null,
-          lng: null,
-          imageUrl: null,
-          price: null,
-          rating: null,
-          meta: null,
-        });
-      }
-      sections.push({ type: "checkin", label: "Check-in", items: checkinItems });
+      const hotelCheckinStart =
+        Number.isFinite(arrivalMinutes) && arrivalMinutes + 60 > 15 * 60
+          ? minutesToClock(arrivalMinutes + 60)
+          : "15:00";
+      const hotelCheckinEnd =
+        Number.isFinite(arrivalMinutes) && arrivalMinutes + 90 > 15 * 60 + 30
+          ? minutesToClock(arrivalMinutes + 90)
+          : "15:30";
+      pushDayItem({
+        id: makePlanId(),
+        type: "hotel",
+        kind: "hotel_checkin",
+        title: hotelResult?.name || `Check-in near ${resolvedDestination}`,
+        subtitle: hotelResult?.name ? resolvedDestination : "Check-in around 3:00 PM",
+        timeWindow: "afternoon",
+        timeOfDay: "afternoon",
+        startTime: `${date}T${hotelCheckinStart}:00`,
+        endTime: `${date}T${hotelCheckinEnd}:00`,
+        source: hotelResult?.hotelId ? "booking_hotels" : null,
+        sourceId: hotelResult?.hotelId ? String(hotelResult.hotelId) : null,
+        lat: hotelResult?.lat ?? null,
+        lng: hotelResult?.lng ?? null,
+        imageUrl: hotelResult?.imageUrl || null,
+        price: hotelResult?.priceTotal
+          ? { amount: hotelResult.priceTotal, currency: hotelResult.currency || "USD" }
+          : null,
+        rating: hotelResult?.reviewScore ?? null,
+        durationMin: 30,
+        meta: { checkinTime: "3:00 PM" },
+      });
     }
 
     if (i === dayCount - 1) {
-      const checkoutItems = [];
-      if (hotelResult?.hotelId) {
-        addUniqueItem(checkoutItems, {
-          id: makePlanId(),
-          type: "hotel",
-          kind: "hotel_checkout",
-          title: `Check-out: ${hotelResult.name || "Hotel"}`,
-          subtitle: "Check-out around 11:00 AM",
-          timeOfDay: "morning",
-          source: "booking_hotels",
-          sourceId: String(hotelResult.hotelId),
-          lat: hotelResult.lat ?? null,
-          lng: hotelResult.lng ?? null,
-          imageUrl: hotelResult.imageUrl || null,
-          price: hotelResult.priceTotal
-            ? { amount: hotelResult.priceTotal, currency: hotelResult.currency || "USD" }
-            : null,
-          rating: hotelResult.reviewScore ?? null,
-          meta: { checkoutTime: "11:00 AM" },
-        });
-      } else {
-        addUniqueItem(checkoutItems, {
-          id: makePlanId(),
-          type: "note",
-          kind: "hotel_checkout",
-          title: "Hotel check-out",
-          subtitle: "Check-out around 11:00 AM",
-          timeOfDay: "morning",
-          source: null,
-          sourceId: null,
-          lat: null,
-          lng: null,
-          imageUrl: null,
-          price: null,
-          rating: null,
-          meta: null,
-        });
-      }
-      if (checkoutItems.length) {
-        sections.push({ type: "checkin", label: "Check-out", items: checkoutItems });
-      }
+      pushDayItem({
+        id: makePlanId(),
+        type: "hotel",
+        kind: "hotel_checkout",
+        title: hotelResult?.name ? `Check-out: ${hotelResult.name}` : "Hotel check-out",
+        subtitle: "Check-out around 11:00 AM",
+        timeWindow: "morning",
+        timeOfDay: "morning",
+        startTime: `${date}T11:00:00`,
+        endTime: `${date}T11:30:00`,
+        source: hotelResult?.hotelId ? "booking_hotels" : null,
+        sourceId: hotelResult?.hotelId ? String(hotelResult.hotelId) : null,
+        lat: hotelResult?.lat ?? null,
+        lng: hotelResult?.lng ?? null,
+        imageUrl: hotelResult?.imageUrl || null,
+        price: hotelResult?.priceTotal
+          ? { amount: hotelResult.priceTotal, currency: hotelResult.currency || "USD" }
+          : null,
+        rating: hotelResult?.reviewScore ?? null,
+        durationMin: 30,
+        meta: { checkoutTime: "11:00 AM" },
+      });
     }
 
-    if (i === 0 && arrivalMinutes !== null && arrivalMinutes < hotelCheckinTime) {
-      const gapItems = [];
-      const gapCoffee = restaurantPool.shift();
-      if (gapCoffee) {
-        addUniqueItem(gapItems, {
-          id: makePlanId(),
-          type: "place",
-          kind: "gap_filler",
-          title: gapCoffee.name || "Quick bite",
-          subtitle: gapCoffee.address || resolvedDestination,
-          timeOfDay: "midday",
-          source: "google",
-          sourceId: gapCoffee.placeId || null,
-          lat: gapCoffee.lat ?? null,
-          lng: gapCoffee.lng ?? null,
-          imageUrl: gapCoffee.imageUrl || null,
-          price: null,
-          rating: gapCoffee.rating ?? null,
-          meta: { meal: "lunch" },
-        });
-      }
-      const gapActivity = attractionPool.shift();
-      if (gapActivity) {
-        addUniqueItem(gapItems, {
-          id: makePlanId(),
-          type: "attraction",
-          kind: "gap_filler",
-          title: gapActivity.name,
-          subtitle: gapActivity.location?.city || resolvedDestination,
-          timeOfDay: "midday",
-          source: "booking_attractions",
-          sourceId: gapActivity.slug || gapActivity.id || null,
-          lat: gapActivity.location?.lat ?? null,
-          lng: gapActivity.location?.lng ?? null,
-          imageUrl: gapActivity.image || null,
-          price: gapActivity.price?.publicAmount
-            ? { amount: gapActivity.price.publicAmount, currency: gapActivity.price.currency }
-            : null,
-          rating: gapActivity.rating?.average ?? null,
-          meta: { attractionId: gapActivity.id },
-        });
-      }
-      if (gapItems.length) {
-        sections.push({ type: "gap", label: "Before check-in", items: gapItems });
-      }
-    }
-
-    const itineraryItems = [];
-    const outlineItems = Array.isArray(outlineDay?.items) ? outlineDay.items : [];
     for (const item of outlineItems) {
-      if (itineraryItems.length >= 3) break;
+      if (!item?.type) continue;
       const base = {
         id: makePlanId(),
-        type: item?.type || "note",
-        kind: "activity",
+        kind: item?.type === "transit" ? "transit" : "activity",
         title: item?.title || "Plan item",
         subtitle: null,
-        timeOfDay: item?.timeOfDay || null,
+        timeWindow: item?.timeWindow || "afternoon",
+        timeOfDay: mapTimeWindowToTimeOfDay(item?.timeWindow),
         source: item?.sourcePreference || null,
         sourceId: null,
         lat: null,
@@ -1912,13 +3057,18 @@ async function buildTripPlanFromPrompt({
         imageUrl: null,
         price: null,
         rating: null,
-        meta: null,
+        durationMin: item?.durationMin ?? null,
+        meta: item?.notes ? { notes: item.notes } : null,
       };
 
-      if (item?.type === "attraction" && attractionsList.length) {
-        const match = pickTopMatchByName(attractionsList, item?.query || item?.title);
+      if (item.type === "restaurant") {
+        continue;
+      }
+
+      if (item.type === "attraction" && attractionsList.length) {
+        const match = pickClusteredAttraction(i, item?.query || item?.title);
         if (match) {
-          addUniqueItem(itineraryItems, {
+          pushDayItem({
             ...base,
             type: "attraction",
             title: match.name || base.title,
@@ -1932,20 +3082,20 @@ async function buildTripPlanFromPrompt({
             price: match.price?.publicAmount
               ? { amount: match.price.publicAmount, currency: match.price.currency || "USD" }
               : null,
-            meta: { attractionId: match.id },
+            meta: { ...(base.meta || {}), attractionId: match.id },
           });
           continue;
         }
       }
 
-      if (item?.type === "place" || item?.type === "attraction") {
+      if (item.type === "place" || item.type === "attraction") {
         const textQuery = item?.query || item?.title || "things to do";
         const place = await findPlaceOnce(textQuery);
         if (place?.id) {
           const photoRef = place?.photos?.[0]?.name || null;
-          addUniqueItem(itineraryItems, {
+          pushDayItem({
             ...base,
-            type: "place",
+            type: item.type === "attraction" ? "attraction" : "place",
             title: place?.displayName?.text || base.title,
             subtitle:
               place?.shortFormattedAddress || place?.formattedAddress || resolvedDestination,
@@ -1955,113 +3105,179 @@ async function buildTripPlanFromPrompt({
             lng: place?.location?.longitude ?? null,
             imageUrl: photoRef ? buildPhotoUrl(photoRef, 500) : null,
             rating: place?.rating ?? null,
-            meta: { userRatingCount: place?.userRatingCount ?? null },
+            meta: { ...(base.meta || {}), userRatingCount: place?.userRatingCount ?? null },
           });
           continue;
         }
       }
+
+      if (item.type === "transit") {
+        pushDayItem({
+          ...base,
+          type: "transit",
+          kind: "transit",
+          subtitle: item?.notes || resolvedDestination,
+        });
+        continue;
+      }
+
+      if (item.type === "hotel" && hotelResult?.hotelId) {
+        pushDayItem({
+          ...base,
+          type: "hotel",
+          kind: "hotel_visit",
+          title: hotelResult.name || base.title,
+          subtitle: resolvedDestination,
+          source: "booking_hotels",
+          sourceId: String(hotelResult.hotelId),
+          lat: hotelResult.lat ?? null,
+          lng: hotelResult.lng ?? null,
+          imageUrl: hotelResult.imageUrl || null,
+          price: hotelResult.priceTotal
+            ? { amount: hotelResult.priceTotal, currency: hotelResult.currency || "USD" }
+            : null,
+          rating: hotelResult.reviewScore ?? null,
+        });
+      }
     }
 
-    while (itineraryItems.length < 3 && attractionPool.length) {
-      const next = attractionPool.shift();
+    while (dayItems.filter((item) => item.type === "attraction" || item.kind === "activity").length < (outlineDay?.maxActivities || 3) && attractionPool.length) {
+      const next = pickClusteredAttraction(i);
       if (!next) break;
-      addUniqueItem(itineraryItems, {
+      const activityIndex = dayItems.filter(
+        (item) => item.type === "attraction" || item.kind === "activity"
+      ).length;
+      pushDayItem({
         id: makePlanId(),
         type: "attraction",
         kind: "activity",
         title: next.name,
         subtitle: next.location?.city || resolvedDestination,
-        timeOfDay: itineraryItems.length === 0 ? "morning" : "afternoon",
+        timeWindow:
+          activityIndex === 0 ? "morning" : activityIndex === 1 ? "afternoon" : "evening",
+        timeOfDay:
+          activityIndex === 0 ? "morning" : activityIndex === 1 ? "afternoon" : "evening",
         source: "booking_attractions",
         sourceId: next.slug || next.id || null,
         lat: next.location?.lat ?? null,
         lng: next.location?.lng ?? null,
         imageUrl: next.image || null,
         price: next.price?.publicAmount
-          ? { amount: next.price.publicAmount, currency: next.price.currency }
+          ? { amount: next.price.publicAmount, currency: next.price.currency || "USD" }
           : null,
         rating: next.rating?.average ?? null,
+        durationMin: null,
         meta: { attractionId: next.id },
       });
     }
 
-    if (itineraryItems.length) {
-      sections.push({ type: "itinerary", label: "Itinerary", items: itineraryItems });
-    }
+    const middayAnchor =
+      dayItems.find((item) => item.timeWindow === "afternoon" && item.lat && item.lng) ||
+      dayItems.find((item) => item.timeWindow === "morning" && item.lat && item.lng) ||
+      null;
+    const eveningAnchor =
+      [...dayItems].reverse().find((item) => (item.timeWindow === "evening" || item.timeWindow === "afternoon") && item.lat && item.lng) ||
+      null;
 
-    const mealItems = [];
-    const lunch = restaurantPool.shift();
-    if (lunch) {
-      addUniqueItem(mealItems, {
-        id: makePlanId(),
-        type: "place",
-        kind: "meal_lunch",
-        title: lunch.name || "Lunch",
-        subtitle: lunch.address || resolvedDestination,
-        timeOfDay: "midday",
-        source: "google",
-        sourceId: lunch.placeId || null,
-        lat: lunch.lat ?? null,
-        lng: lunch.lng ?? null,
-        imageUrl: lunch.imageUrl || null,
-        price: null,
-        rating: lunch.rating ?? null,
-        meta: { meal: "lunch" },
-      });
-    }
-    const dinner = restaurantPool.shift();
-    if (dinner) {
-      addUniqueItem(mealItems, {
-        id: makePlanId(),
-        type: "place",
-        kind: "meal_dinner",
-        title: dinner.name || "Dinner",
-        subtitle: dinner.address || resolvedDestination,
-        timeOfDay: "evening",
-        source: "google",
-        sourceId: dinner.placeId || null,
-        lat: dinner.lat ?? null,
-        lng: dinner.lng ?? null,
-        imageUrl: dinner.imageUrl || null,
-        price: null,
-        rating: dinner.rating ?? null,
-        meta: { meal: "dinner" },
-      });
-    }
-    if (mealItems.length) {
-      sections.push({ type: "meals", label: "Meals", items: mealItems });
-    }
+    pushDayItem(
+      buildRestaurantPlanItem(
+        pickRestaurantForMeal(
+          restaurantPool,
+          "lunch",
+          middayAnchor ? { lat: middayAnchor.lat, lng: middayAnchor.lng } : center
+        ),
+        resolvedDestination,
+        "lunch"
+      )
+    );
+    pushDayItem(
+      buildRestaurantPlanItem(
+        pickRestaurantForMeal(
+          restaurantPool,
+          "dinner",
+          eveningAnchor ? { lat: eveningAnchor.lat, lng: eveningAnchor.lng } : center
+        ),
+        resolvedDestination,
+        "dinner"
+      )
+    );
 
     if (i === dayCount - 1 && (flightPreview || hasReturnFlight)) {
-      const departItems = [];
-      addUniqueItem(departItems, {
+      pushDayItem({
         id: makePlanId(),
         type: "flight",
         kind: "departure_flight",
         title: `Return flight: ${flightPreview.toLabel} → ${flightPreview.fromLabel}`,
         subtitle:
-          `${flightPreview.returnDepartAt || flightPreview.departAt || ""} • ` +
-          `${flightPreview.returnArriveAt || flightPreview.arriveAt || ""}`,
+          `${flightPreview.airlineName || flightPreview.airlineCode || "Flight"} • ` +
+          `${flightPreview.returnDepartAt || flightPreview.departAt || ""} → ` +
+          `${flightPreview.returnArriveAt || flightPreview.arriveAt || ""} • ` +
+          `${flightPreview.stops === 0 ? "nonstop" : `${flightPreview.stops || 0} stop`}`,
+        timeWindow: "evening",
         timeOfDay: "evening",
+        startTime: flightPreview.returnDepartAt || flightPreview.departAt || null,
+        endTime: flightPreview.returnArriveAt || flightPreview.arriveAt || null,
         source: "booking_flights",
-        sourceId: null,
+        sourceId: flightPreview.offerId || flightPreview.bookingToken || null,
         lat: null,
         lng: null,
         imageUrl: null,
         price: flightPreview.price,
         rating: null,
-        meta: flightPreview,
+        durationMin: flightPreview.durationSec ? Math.max(30, Math.round(flightPreview.durationSec / 60)) : null,
+        meta: buildPlanFlightMeta(flightPreview, {
+          fromId: flightPreview.toId,
+          toId: flightPreview.fromId,
+          fromLabel: flightPreview.toLabel,
+          toLabel: flightPreview.fromLabel,
+          departTime: flightPreview.returnDepartAt || flightPreview.departAt || null,
+          arriveTime: flightPreview.returnArriveAt || flightPreview.arriveAt || null,
+          departAirportCode: flightPreview.toLabel || null,
+          arriveAirportCode: flightPreview.fromLabel || null,
+        }),
       });
-      sections.push({ type: "departure", label: "Departure", items: departItems });
+    } else if (i === dayCount - 1 && !overrides?.userPrefs?.roadTrip) {
+      pushDayItem({
+        id: makePlanId(),
+        type: "flight",
+        kind: "departure_flight",
+        title: `Return flight from ${resolvedDestination}`,
+        subtitle: "Add your departure airport to lock a real return option.",
+        timeWindow: "evening",
+        timeOfDay: "evening",
+        startTime: `${date}T19:00:00`,
+        endTime: `${date}T21:00:00`,
+        source: null,
+        sourceId: null,
+        lat: null,
+        lng: null,
+        imageUrl: null,
+        price: null,
+        rating: null,
+        durationMin: 120,
+        meta: { placeholder: true },
+      });
     }
 
-    const flatItems = sections.flatMap((section) => section.items || []);
+    const scheduledItems = scheduleDay({
+      date,
+      items: dayItems,
+      dayStartTime: firstDayStartTime,
+      dayEndTime: lastDayEndTime,
+      maxActivities: outlineDay?.maxActivities || 3,
+    }).map((item) => ({
+      ...item,
+      timeOfDay: item.timeOfDay || mapTimeWindowToTimeOfDay(item.timeWindow),
+    }));
+
     planDays.push({
       date,
       label: outlineDay?.label || `Day ${i + 1}`,
       theme: outlineDay?.theme || null,
-      items: flatItems,
-      sections,
+      dayStartTime: firstDayStartTime,
+      dayEndTime: lastDayEndTime,
+      maxActivities: outlineDay?.maxActivities || 3,
+      items: scheduledItems,
     });
   }
 
@@ -2116,8 +3332,468 @@ async function buildTripPlanFromPrompt({
     },
   };
 
+  const attractionEntities = [];
+  const restaurantEntities = [];
+  const hotelEntities = [];
+  for (const day of planDays) {
+    for (const item of day?.items || []) {
+      if (item?.type === "attraction") {
+        attractionEntities.push({
+          id: buildEntityRefId("a", item),
+          provider_id: item?.sourceId || null,
+          name: item?.title || null,
+          lat: item?.lat ?? null,
+          lng: item?.lng ?? null,
+          category: item?.kind || "activity",
+          source: item?.source || null,
+        });
+      }
+      if (item?.type === "restaurant") {
+        restaurantEntities.push({
+          id: buildEntityRefId("r", item),
+          provider_id: item?.sourceId || null,
+          name: item?.title || null,
+          lat: item?.lat ?? null,
+          lng: item?.lng ?? null,
+          category: item?.meta?.meal || "restaurant",
+          source: item?.source || null,
+        });
+      }
+      if (item?.type === "hotel") {
+        hotelEntities.push({
+          id: buildEntityRefId("h", item),
+          provider_id: item?.sourceId || null,
+          name: item?.title || null,
+          lat: item?.lat ?? null,
+          lng: item?.lng ?? null,
+          category: item?.kind || "hotel",
+          source: item?.source || null,
+        });
+      }
+    }
+  }
+
+  const draft = {
+    threadId: overrides?.threadId || null,
+    tripId: resolvedTripId,
+    startDate,
+    endDate,
+    destinationLabel: resolvedDestination,
+    budgetTier: normalizeBudgetTier(overrides?.userPrefs?.budget),
+    vibes: normalizeVibes(overrides?.userPrefs?.vibe),
+    travelers: {
+      adults: adultsCount,
+      children: Number(overrides?.userPrefs?.travelerBreakdown?.children || 0),
+    },
+    needsConfirmation,
+    message: needsConfirmation
+      ? `I built a realistic ${planDays.length}-day plan for ${resolvedDestination} using ${startDate} to ${endDate}. Confirm the dates and I can tighten it further.`
+      : `I built a realistic ${planDays.length}-day plan for ${resolvedDestination}. Want a cheaper flight or a more walkable hotel area?`,
+    selectedFlight: buildFlightCardSelection(flightBundle.selected, resolvedFlightFrom, resolvedFlightTo),
+    flightAlternates: flightBundle.alternates.map((offer) => buildFlightCardSelection(offer, resolvedFlightFrom, resolvedFlightTo)),
+    selectedHotel: hotelResult
+      ? {
+          provider: "booking_hotels",
+          hotel_id: String(hotelResult.hotelId),
+          name: hotelResult.name || null,
+          rating: hotelResult.reviewScore ?? null,
+          price_per_night: hotelResult.priceTotal
+            ? {
+                amount: Number(hotelResult.priceTotal) / Math.max(1, dayCount - 1),
+                currency: hotelResult.currency || "USD",
+              }
+            : null,
+          location: {
+            name: resolvedDestination,
+            lat: hotelResult.lat ?? null,
+            lng: hotelResult.lng ?? null,
+          },
+          image_url: hotelResult.imageUrl || null,
+        }
+      : null,
+    hotelAlternates: hotelCandidates.slice(1, 5).map((hotel) => ({
+      provider: "booking_hotels",
+      hotel_id: String(hotel.hotelId),
+      name: hotel.name || null,
+      rating: hotel.reviewScore ?? null,
+      price_per_night: hotel.priceTotal
+        ? { amount: Number(hotel.priceTotal) / Math.max(1, dayCount - 1), currency: hotel.currency || "USD" }
+        : null,
+      location: {
+        name: resolvedDestination,
+        lat: hotel.lat ?? null,
+        lng: hotel.lng ?? null,
+      },
+      image_url: hotel.imageUrl || null,
+    })),
+    plan,
+    pools: {
+      attractions: attractionsList,
+      restaurants: restaurantsList,
+      hotels: hotelCandidates,
+      flights: (flightBundle.selected ? [flightBundle.selected] : []).concat(flightBundle.alternates),
+    },
+    entities: {
+      attractions: dedupeBy(attractionEntities, (item) => item.id),
+      restaurants: dedupeBy(restaurantEntities, (item) => item.id),
+      hotels: dedupeBy(hotelEntities, (item) => item.id),
+    },
+    locks: existingDraft?.locks || { flight: false, hotel: false, locked_days: [] },
+    usedIds: {
+      attractions: dedupeBy(
+        [...(usedIds.attractions || []), ...attractionEntities.map((item) => item.provider_id).filter(Boolean)],
+        (item) => item
+      ),
+      restaurants: dedupeBy(
+        [...(usedIds.restaurants || []), ...restaurantEntities.map((item) => item.provider_id).filter(Boolean)],
+        (item) => item
+      ),
+      hotels: dedupeBy(
+        [...(usedIds.hotels || []), ...(hotelResult?.hotelId ? [String(hotelResult.hotelId)] : [])],
+        (item) => item
+      ),
+    },
+    debug: {
+      used_pages: { attractions: 4, hotels: 3, restaurants: 4 },
+      dedupe_removed: {
+        attractions: Math.max(0, 4 * 20 - attractionsList.length),
+        hotels: Math.max(0, 3 * 25 - hotelCandidates.length),
+        restaurants: Math.max(0, 4 * 12 - restaurantsList.length),
+      },
+    },
+  };
+  const structuredResponse = buildTripDraftResponse(draft);
+
   console.log("[plan] outline_ms", outlineMs, "total_ms", Date.now() - startedAt);
-  return { plan, assistantMessage, tripId: resolvedTripId };
+  return { plan, assistantMessage, assistantResponse: structuredResponse, tripId: resolvedTripId, draft };
+}
+
+function rotateDraftFlight(draft) {
+  if (!draft?.selectedFlight || !Array.isArray(draft?.flightAlternates) || !draft.flightAlternates.length) {
+    return draft;
+  }
+  const [next, ...rest] = draft.flightAlternates;
+  return {
+    ...draft,
+    selectedFlight: next,
+    flightAlternates: [...rest, draft.selectedFlight].filter(Boolean).slice(0, 4),
+    message: "I swapped in the next-best flight option and kept the rest as alternates.",
+  };
+}
+
+function rotateDraftHotel(draft) {
+  if (!draft?.selectedHotel || !Array.isArray(draft?.hotelAlternates) || !draft.hotelAlternates.length) {
+    return draft;
+  }
+  const [next, ...rest] = draft.hotelAlternates;
+  return {
+    ...draft,
+    selectedHotel: next,
+    hotelAlternates: [...rest, draft.selectedHotel].slice(0, 4),
+    message: "I swapped the hotel to the next-best alternate.",
+  };
+}
+
+function regenerateDraftDay(draft, date) {
+  const targetDate = String(date || "");
+  const pools = draft?.pools || {};
+  const dayIndex = (draft?.plan?.days || []).findIndex((day) => day?.date === targetDate);
+  if (dayIndex < 0) return draft;
+  if (draft?.locks?.locked_days?.includes(targetDate)) return draft;
+
+  const attractions = filterNovelItems(
+    pools.attractions || [],
+    draft?.usedIds?.attractions || [],
+    (item) => String(item?.slug || item?.id || item?.name || ""),
+    6
+  );
+  const restaurants = filterNovelItems(
+    pools.restaurants || [],
+    draft?.usedIds?.restaurants || [],
+    (item) => String(item?.placeId || item?.providerId || item?.name || ""),
+    4
+  );
+
+  const nextAttraction = attractions[0];
+  const secondAttraction = attractions[1] || attractions[0] || null;
+  const lunch = restaurants[0];
+  const dinner = restaurants[1] || restaurants[0] || null;
+  const day = draft.plan.days[dayIndex];
+  const newItems = [];
+
+  if (nextAttraction) {
+    newItems.push({
+      id: makePlanId(),
+      type: "attraction",
+      kind: "activity",
+      title: nextAttraction.name,
+      source: "booking_attractions",
+      sourceId: nextAttraction.slug || nextAttraction.id || null,
+      lat: nextAttraction.location?.lat ?? null,
+      lng: nextAttraction.location?.lng ?? null,
+      imageUrl: nextAttraction.image || null,
+      timeWindow: "morning",
+    });
+  }
+  if (lunch) newItems.push(buildRestaurantPlanItem(lunch, draft.destinationLabel, "lunch"));
+  if (secondAttraction) {
+    newItems.push({
+      id: makePlanId(),
+      type: "attraction",
+      kind: "activity",
+      title: secondAttraction.name,
+      source: "booking_attractions",
+      sourceId: secondAttraction.slug || secondAttraction.id || null,
+      lat: secondAttraction.location?.lat ?? null,
+      lng: secondAttraction.location?.lng ?? null,
+      imageUrl: secondAttraction.image || null,
+      timeWindow: "afternoon",
+    });
+  }
+  if (dinner) newItems.push(buildRestaurantPlanItem(dinner, draft.destinationLabel, "dinner"));
+
+  const scheduled = scheduleDay({
+    date: day.date,
+    items: newItems,
+    dayStartTime: day.dayStartTime || SCHEDULE_DEFAULTS.dayStartTime,
+    dayEndTime: day.dayEndTime || SCHEDULE_DEFAULTS.dayEndTime,
+    maxActivities: 3,
+  });
+
+  const nextDays = draft.plan.days.map((entry) =>
+    entry.date === targetDate ? { ...entry, items: scheduled, theme: `${entry.theme || entry.label} refreshed` } : entry
+  );
+
+  return {
+    ...draft,
+    plan: { ...draft.plan, days: nextDays },
+    message: `I rebuilt ${targetDate} with a different mix of places.`,
+    usedIds: {
+      ...draft.usedIds,
+      attractions: dedupeBy(
+        [...(draft?.usedIds?.attractions || []), ...newItems.map((item) => item.sourceId).filter(Boolean)],
+        (item) => item
+      ),
+      restaurants: dedupeBy(
+        [...(draft?.usedIds?.restaurants || []), ...newItems.filter((item) => item.type === "restaurant").map((item) => item.sourceId).filter(Boolean)],
+        (item) => item
+      ),
+    },
+  };
+}
+
+function lockDraftPlan(draft) {
+  return {
+    ...draft,
+    locks: {
+      flight: true,
+      hotel: true,
+      locked_days: (draft?.plan?.days || []).map((day) => day?.date).filter(Boolean),
+    },
+    message: "Locked the current flight, hotel, and itinerary days.",
+  };
+}
+
+function tuneDraft(draft, payload = {}) {
+  const budgetTier = payload?.budget_tier ? normalizeBudgetTier(payload.budget_tier) : draft?.budgetTier;
+  const addedVibes = normalizeVibes(payload?.vibe_add || []);
+  const removedVibes = normalizeVibes(payload?.vibe_remove || []);
+  const nextVibes = dedupeBy(
+    [...(draft?.vibes || []), ...addedVibes].filter((item) => !removedVibes.includes(item)),
+    (item) => item
+  );
+  let nextDraft = {
+    ...draft,
+    budgetTier,
+    vibes: nextVibes,
+  };
+
+  const notes = [];
+  if (budgetTier !== draft?.budgetTier) {
+    notes.push(`set budget to ${budgetTier}`);
+  }
+
+  if (budgetTier === "budget") {
+    const tunedCheaper = tuneDraftToCheaperOptions(nextDraft);
+    if (tunedCheaper.changedFlights) notes.push("swapped to a cheaper flight");
+    if (tunedCheaper.changedHotels) notes.push("swapped to a cheaper hotel");
+    nextDraft = tunedCheaper.draft;
+  }
+
+  if (addedVibes.includes("nightlife")) {
+    const nightlife = tuneDraftForNightlife(nextDraft);
+    if (nightlife.changedDays > 0) notes.push(`added nightlife to ${nightlife.changedDays} day(s)`);
+    nextDraft = nightlife.draft;
+  }
+
+  if (addedVibes.includes("museum")) {
+    const museum = tuneDraftForMuseums(nextDraft);
+    if (museum.changedDays > 0) notes.push(`added museum time to ${museum.changedDays} day(s)`);
+    nextDraft = museum.draft;
+  }
+
+  if (addedVibes.includes("walkable")) {
+    notes.push("prioritized more walkable pacing");
+  }
+  if (addedVibes.includes("day_trip")) {
+    notes.push("added a day-trip preference");
+  }
+
+  const message = notes.length
+    ? `Updated the plan: ${notes.join("; ")}.`
+    : "Updated the plan preferences.";
+
+  return { ...nextDraft, message };
+}
+
+function parseDraftTunePayloadFromMessage(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return null;
+  if (text.includes("cheaper")) return { budget_tier: "budget" };
+  if (text.includes("more premium") || text.includes("more luxury") || text.includes("luxury")) {
+    return { budget_tier: "luxury" };
+  }
+  if (text.includes("more nightlife") || text.includes("nightlife")) return { vibe_add: ["nightlife"] };
+  if (text.includes("more museums") || text.includes("museum")) return { vibe_add: ["museum"] };
+  if (text.includes("walkable")) return { vibe_add: ["walkable"] };
+  if (text.includes("day trip")) return { vibe_add: ["day_trip"] };
+  return null;
+}
+
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function flightPriceAmount(flight) {
+  return toFiniteNumber(flight?.price?.amount);
+}
+
+function hotelNightlyAmount(hotel) {
+  return toFiniteNumber(hotel?.price_per_night?.amount);
+}
+
+function tuneDraftToCheaperOptions(draft) {
+  let changedFlights = false;
+  let changedHotels = false;
+  let selectedFlight = draft?.selectedFlight || null;
+  let flightAlternates = Array.isArray(draft?.flightAlternates) ? draft.flightAlternates.slice() : [];
+  let selectedHotel = draft?.selectedHotel || null;
+  let hotelAlternates = Array.isArray(draft?.hotelAlternates) ? draft.hotelAlternates.slice() : [];
+
+  if (selectedFlight) {
+    const flightPool = [selectedFlight, ...flightAlternates];
+    const cheapestFlight = flightPool
+      .filter((item) => flightPriceAmount(item) !== null)
+      .sort((a, b) => flightPriceAmount(a) - flightPriceAmount(b))[0];
+    if (cheapestFlight && cheapestFlight !== selectedFlight) {
+      changedFlights = true;
+      selectedFlight = cheapestFlight;
+      flightAlternates = flightPool.filter((item) => item !== cheapestFlight).slice(0, 4);
+    }
+  }
+
+  if (selectedHotel) {
+    const hotelPool = [selectedHotel, ...hotelAlternates];
+    const cheapestHotel = hotelPool
+      .filter((item) => hotelNightlyAmount(item) !== null)
+      .sort((a, b) => hotelNightlyAmount(a) - hotelNightlyAmount(b))[0];
+    if (cheapestHotel && cheapestHotel !== selectedHotel) {
+      changedHotels = true;
+      selectedHotel = cheapestHotel;
+      hotelAlternates = hotelPool.filter((item) => item !== cheapestHotel).slice(0, 4);
+    }
+  }
+
+  return {
+    changedFlights,
+    changedHotels,
+    draft: {
+      ...draft,
+      selectedFlight,
+      flightAlternates,
+      selectedHotel,
+      hotelAlternates,
+    },
+  };
+}
+
+function isUnlockedDay(draft, day) {
+  const locked = draft?.locks?.locked_days || [];
+  return !locked.includes(day?.date);
+}
+
+function tuneDraftForNightlife(draft) {
+  const nightlifePool = (draft?.pools?.restaurants || []).filter((item) =>
+    /\b(bar|pub|club|lounge|cocktail|brewery|taproom|speakeasy|night)\b/i.test(
+      String(item?.name || "")
+    )
+  );
+  if (!nightlifePool.length || !Array.isArray(draft?.plan?.days)) {
+    return { changedDays: 0, draft };
+  }
+
+  let idx = 0;
+  let changedDays = 0;
+  const nextDays = draft.plan.days.map((day) => {
+    if (!isUnlockedDay(draft, day)) return day;
+    const items = Array.isArray(day?.items) ? day.items.slice() : [];
+    const dinnerIdx = items.findIndex(
+      (item) =>
+        item?.type === "restaurant" &&
+        (item?.meta?.meal === "dinner" || item?.timeWindow === "dinner")
+    );
+    const targetIdx = dinnerIdx >= 0 ? dinnerIdx : items.findIndex((item) => item?.type === "restaurant");
+    if (targetIdx < 0) return day;
+    const pick = nightlifePool[idx % nightlifePool.length];
+    idx += 1;
+    items[targetIdx] = {
+      ...items[targetIdx],
+      title: pick?.name || items[targetIdx].title,
+      sourceId: pick?.placeId || pick?.providerId || items[targetIdx].sourceId,
+      imageUrl: pick?.imageUrl || items[targetIdx].imageUrl,
+      lat: pick?.lat ?? items[targetIdx].lat ?? null,
+      lng: pick?.lng ?? items[targetIdx].lng ?? null,
+      meta: { ...(items[targetIdx].meta || {}), meal: "dinner" },
+    };
+    changedDays += 1;
+    return { ...day, items };
+  });
+
+  return { changedDays, draft: { ...draft, plan: { ...draft.plan, days: nextDays } } };
+}
+
+function tuneDraftForMuseums(draft) {
+  const museumPool = (draft?.pools?.attractions || []).filter((item) =>
+    /\b(museum|gallery|history|heritage|science|art)\b/i.test(String(item?.name || ""))
+  );
+  if (!museumPool.length || !Array.isArray(draft?.plan?.days)) {
+    return { changedDays: 0, draft };
+  }
+
+  let idx = 0;
+  let changedDays = 0;
+  const nextDays = draft.plan.days.map((day) => {
+    if (!isUnlockedDay(draft, day)) return day;
+    const items = Array.isArray(day?.items) ? day.items.slice() : [];
+    const attractionIdx = items.findIndex((item) => item?.type === "attraction");
+    if (attractionIdx < 0) return day;
+    const pick = museumPool[idx % museumPool.length];
+    idx += 1;
+    items[attractionIdx] = {
+      ...items[attractionIdx],
+      title: pick?.name || items[attractionIdx].title,
+      sourceId: pick?.slug || pick?.id || items[attractionIdx].sourceId,
+      imageUrl: pick?.image || items[attractionIdx].imageUrl,
+      lat: pick?.location?.lat ?? items[attractionIdx].lat ?? null,
+      lng: pick?.location?.lng ?? items[attractionIdx].lng ?? null,
+      kind: "activity",
+    };
+    changedDays += 1;
+    return { ...day, items };
+  });
+
+  return { changedDays, draft: { ...draft, plan: { ...draft.plan, days: nextDays } } };
 }
 
 
@@ -2126,48 +3802,191 @@ export async function assistantRoutes(app) {
     const authUser = await requireAuth(req, reply);
     if (!authUser) return;
 
-    const { tripId, promptText, userPrefs, startDate, endDate, destinationLabel } = req.body || {};
+    const { tripId, promptText, userPrefs, startDate, endDate, destinationLabel, threadId, workspaceId } = req.body || {};
     if (!promptText) {
       return reply.code(400).send({ error: "promptText is required" });
+    }
+    const assistantThreadId = getAssistantThreadId({ threadId, workspaceId, tripId });
+    const existingDraft = await loadTripDraft(authUser, assistantThreadId);
+
+    let plannerTripId = tripId || null;
+    try {
+      plannerTripId = await ensurePlannerTripForMessage({
+        authUser,
+        tripId,
+        createTripPrefs: userPrefs || null,
+        destinationLabel: destinationLabel || detectLocationInMessage(promptText),
+        startDate: startDate || parseDateRangeFromText(promptText)?.startDate || null,
+        endDate: endDate || parseDateRangeFromText(promptText)?.endDate || null,
+      });
+    } catch (err) {
+      return reply.code(500).send({ error: err?.message ?? String(err) });
     }
 
     const result = await buildTripPlanFromPrompt({
       promptText,
-      tripId,
+      tripId: plannerTripId,
       authUser,
-      overrides: { userPrefs, startDate, endDate, destinationLabel },
+      overrides: { userPrefs, startDate, endDate, destinationLabel, threadId: assistantThreadId, existingDraft },
     });
 
+    if (result?.draft) {
+      await persistTripDraft(authUser, assistantThreadId, result.draft);
+    }
+    if (result?.error && result?.assistantResponse) {
+      return reply.send(result.assistantResponse);
+    }
     if (result?.error && result?.assistantMessage) {
-      return reply.send({ assistantMessage: result.assistantMessage });
+      return reply.send({ assistantMessage: result.assistantMessage, thread_id: assistantThreadId });
     }
     if (result?.error) {
       return reply.code(500).send({ error: result.error });
     }
 
-    return reply.send({
+    return reply.send(result.assistantResponse || {
       assistantMessage: result.assistantMessage,
       planId: result.plan?.id,
-      tripId: result.tripId,
+      tripId: result.tripId || plannerTripId,
+      thread_id: assistantThreadId,
     });
   });
 
+  app.post("/actions/swap-flight", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+    const assistantThreadId = getAssistantThreadId(req.body || {});
+    const draft = await loadTripDraft(authUser, assistantThreadId);
+    if (!draft) return reply.code(404).send({ error: "Trip draft not found" });
+    const nextDraft = rotateDraftFlight(draft);
+    await persistTripDraft(authUser, assistantThreadId, nextDraft);
+    return reply.send(buildTripDraftResponse(nextDraft));
+  });
+
+  app.post("/actions/swap-hotel", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+    const assistantThreadId = getAssistantThreadId(req.body || {});
+    const draft = await loadTripDraft(authUser, assistantThreadId);
+    if (!draft) return reply.code(404).send({ error: "Trip draft not found" });
+    const nextDraft = rotateDraftHotel(draft);
+    await persistTripDraft(authUser, assistantThreadId, nextDraft);
+    return reply.send(buildTripDraftResponse(nextDraft));
+  });
+
+  app.post("/actions/regenerate-day", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+    const assistantThreadId = getAssistantThreadId(req.body || {});
+    const draft = await loadTripDraft(authUser, assistantThreadId);
+    if (!draft) return reply.code(404).send({ error: "Trip draft not found" });
+    const nextDraft = regenerateDraftDay(draft, req.body?.date);
+    await persistTripDraft(authUser, assistantThreadId, nextDraft);
+    return reply.send(buildTripDraftResponse(nextDraft));
+  });
+
+  app.post("/actions/more-attractions", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+    const assistantThreadId = getAssistantThreadId(req.body || {});
+    const draft = await loadTripDraft(authUser, assistantThreadId);
+    if (!draft) return reply.code(404).send({ error: "Trip draft not found" });
+    const count = Math.max(1, Math.min(20, Number(req.body?.count || 10)));
+    const fresh = filterNovelItems(
+      draft?.pools?.attractions || [],
+      draft?.usedIds?.attractions || [],
+      (item) => String(item?.slug || item?.id || item?.name || ""),
+      count
+    ).slice(0, count);
+    const extraCard = {
+      type: "attractions_list_card",
+      title: "More attractions",
+      items: fresh.map((item) => ({
+        ref_id: buildEntityRefId("a", { sourceId: item?.slug || item?.id, name: item?.name }),
+        name: item?.name || null,
+        rating: item?.rating?.average ?? null,
+        price: item?.price?.publicAmount ?? item?.price?.amount ?? null,
+        lat: item?.location?.lat ?? null,
+        lng: item?.location?.lng ?? null,
+      })),
+    };
+    return reply.send(buildTripDraftResponse(draft, [extraCard]));
+  });
+
+  app.post("/actions/lock-plan", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+    const assistantThreadId = getAssistantThreadId(req.body || {});
+    const draft = await loadTripDraft(authUser, assistantThreadId);
+    if (!draft) return reply.code(404).send({ error: "Trip draft not found" });
+    const nextDraft = lockDraftPlan(draft);
+    await persistTripDraft(authUser, assistantThreadId, nextDraft);
+    const promotedTripId = String(nextDraft?.tripId || "").trim() || null;
+    const lockedPlanId = String(nextDraft?.plan?.id || "").trim() || null;
+
+    let warningMessage = null;
+    if (promotedTripId) {
+      const updatePayload = {
+        planning_state: "unconfirmed",
+        locked_at: new Date().toISOString(),
+        confirmed_at: null,
+      };
+      if (lockedPlanId) {
+        updatePayload.locked_plan_id = lockedPlanId;
+      }
+
+      const { data, error } = await supabaseAdmin
+        .from("trips")
+        .update(updatePayload)
+        .eq("id", promotedTripId)
+        .eq("user_id", authUser.id)
+        .select("id")
+        .maybeSingle();
+
+      if (error || !data?.id) {
+        warningMessage = "Plan locked in chat, but we couldn't add it to My Trips yet.";
+      }
+    } else {
+      warningMessage = "Plan locked in chat. Add trip dates/destination to save it in My Trips.";
+    }
+
+    const payload = buildTripDraftResponse(nextDraft);
+    if (warningMessage) {
+      payload.message = warningMessage;
+    }
+    return reply.send(payload);
+  });
+
+  app.post("/actions/tune", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+    const assistantThreadId = getAssistantThreadId(req.body || {});
+    const draft = await loadTripDraft(authUser, assistantThreadId);
+    if (!draft) return reply.code(404).send({ error: "Trip draft not found" });
+    const nextDraft = tuneDraft(draft, req.body || {});
+    await persistTripDraft(authUser, assistantThreadId, nextDraft);
+    return reply.send(buildTripDraftResponse(nextDraft));
+  });
+
   app.post("/chat", async (req, reply) => {
-    const { message, tripId, workspaceId, createTripPrefs: createTripPrefsRaw } = req.body || {};
+    const { message, tripId, workspaceId, threadId, createTripPrefs: createTripPrefsRaw } = req.body || {};
     if (!message) {
       return reply.code(400).send({ error: "Missing message" });
     }
 
     const authUser = await requireAuth(req, reply);
     if (!authUser) return;
+    const clientLat = Number(req.body?.clientLat);
+    const clientLng = Number(req.body?.clientLng);
 
-    const contextId = workspaceId || tripId;
+    const contextId = getAssistantThreadId({ threadId, workspaceId, tripId });
     const ctx = getAssistantContext(authUser, contextId);
-    const effectiveIntent = getEffectiveIntent(message, ctx);
+    const contextualMessage = applyContextualLocationHint(message, ctx?.location || null);
+    const existingDraft = await loadTripDraft(authUser, contextId);
+    const effectiveIntent = getEffectiveIntent(contextualMessage, ctx);
     const createTripPrefs = normalizeCreateTripPrefs(createTripPrefsRaw);
     const effectiveUserPrefs = createTripPrefs || ctx?.createTripPrefs || null;
-    const detectedLocation = detectLocationInMessage(message);
-    const detectedMode = detectTravelMode(message);
+    const detectedLocation = detectLocationInMessage(contextualMessage);
+    const detectedMode = detectTravelMode(contextualMessage);
     if (detectedLocation) {
       setAssistantContext(authUser, contextId, { location: detectedLocation });
     }
@@ -2178,82 +3997,223 @@ export async function assistantRoutes(app) {
       setAssistantContext(authUser, contextId, { createTripPrefs });
     }
 
+    if (messageAsksForSummary(message) || (ctx?.pendingSummary && messageIsAffirmative(message))) {
+      const latestCtx = getAssistantContext(authUser, contextId);
+      setAssistantContext(authUser, contextId, { pendingSummary: false });
+      return reply.send({
+        assistantMessage: buildContextSummaryMessage(latestCtx),
+      });
+    }
+
     if (ctx?.pendingPlan) {
       const parsedDates = parseDateRangeFromText(message);
-      if (parsedDates?.startDate && parsedDates?.endDate) {
+      const followupLocation =
+        detectLocationInMessage(message) || detectStandaloneLocationReply(message);
+      if (parsedDates?.startDate || parsedDates?.endDate || followupLocation) {
+        const nextDestinationLabel = followupLocation || ctx.pendingPlan.destinationLabel || null;
+        const nextStartDate =
+          parsedDates?.startDate ||
+          ctx.pendingPlan.startDate ||
+          createTripPrefs?.startDate ||
+          ctx.pendingPlan.userPrefs?.startDate ||
+          ctx?.createTripPrefs?.startDate ||
+          null;
+        const nextEndDate =
+          parsedDates?.endDate ||
+          ctx.pendingPlan.endDate ||
+          createTripPrefs?.endDate ||
+          ctx.pendingPlan.userPrefs?.endDate ||
+          ctx?.createTripPrefs?.endDate ||
+          null;
+        let plannerTripId = tripId || null;
+        try {
+          plannerTripId = await ensurePlannerTripForMessage({
+            authUser,
+            tripId,
+            createTripPrefs:
+              createTripPrefs || ctx.pendingPlan.userPrefs || ctx?.createTripPrefs || null,
+            destinationLabel: nextDestinationLabel,
+            startDate: nextStartDate,
+            endDate: nextEndDate,
+          });
+        } catch (err) {
+          const messageText = err?.message ?? String(err);
+          return reply.code(500).send({ error: messageText });
+        }
+
         const result = await buildTripPlanFromPrompt({
           promptText: ctx.pendingPlan.promptText || message,
-          tripId,
+          tripId: plannerTripId,
           authUser,
           overrides: {
-            destinationLabel: ctx.pendingPlan.destinationLabel,
-            startDate: parsedDates.startDate,
-            endDate: parsedDates.endDate,
+            destinationLabel: nextDestinationLabel,
+            startDate: nextStartDate,
+            endDate: nextEndDate,
             userPrefs:
               createTripPrefs ||
               ctx.pendingPlan.userPrefs ||
               ctx?.createTripPrefs ||
               undefined,
+            clientLat,
+            clientLng,
+            threadId: contextId,
+            existingDraft,
           },
         });
-        setAssistantContext(authUser, contextId, { pendingPlan: null });
+        if (result?.draft) await persistTripDraft(authUser, contextId, result.draft);
+        if (result?.error === "missing_dates" || result?.error === "missing_destination") {
+          setAssistantContext(authUser, contextId, {
+            pendingPlan: {
+              ...ctx.pendingPlan,
+              destinationLabel: nextDestinationLabel,
+              startDate: nextStartDate,
+              endDate: nextEndDate,
+              userPrefs: createTripPrefs || ctx.pendingPlan.userPrefs || ctx?.createTripPrefs || undefined,
+            },
+          });
+        } else {
+          setAssistantContext(authUser, contextId, { pendingPlan: null });
+        }
+        if (result?.assistantResponse) {
+          return reply.send(result.assistantResponse);
+        }
         if (result?.assistantMessage) {
           return reply.send({
             assistantMessage: result.assistantMessage,
             planId: result.plan?.id,
-            tripId: result.tripId,
+            tripId: result.tripId || plannerTripId,
+            thread_id: contextId,
           });
         }
       }
     }
 
+    const tunePayloadFromMessage = parseDraftTunePayloadFromMessage(message);
+    if (tunePayloadFromMessage) {
+      let draftToTune = existingDraft;
+      if (!draftToTune && tripId) {
+        draftToTune = await loadLatestTripDraftByTripId(authUser, tripId);
+      }
+      if (draftToTune) {
+        const nextDraft = tuneDraft(draftToTune, tunePayloadFromMessage);
+        const persistThreadId = nextDraft?.threadId || contextId;
+        await persistTripDraft(authUser, persistThreadId, nextDraft);
+        setAssistantContext(authUser, contextId, {
+          pendingIntent: null,
+          lastIntent: "trip_plan_tune",
+        });
+        return reply.send(buildTripDraftResponse(nextDraft));
+      }
+    }
+
     if (createTripPrefs?.destination) {
+      let plannerTripId = tripId || null;
+      try {
+        plannerTripId = await ensurePlannerTrip({
+          authUser,
+          tripId,
+          createTripPrefs,
+          destinationLabel: createTripPrefs.destination,
+          startDate: createTripPrefs.startDate || null,
+          endDate: createTripPrefs.endDate || null,
+        });
+      } catch (err) {
+        const messageText = err?.message ?? String(err);
+        return reply.code(500).send({ error: messageText });
+      }
+
       const result = await buildTripPlanFromPrompt({
         promptText: message,
-        tripId,
+        tripId: plannerTripId,
         authUser,
         overrides: {
           destinationLabel: createTripPrefs.destination,
           startDate: createTripPrefs.startDate || null,
           endDate: createTripPrefs.endDate || null,
           userPrefs: createTripPrefs,
+          clientLat,
+          clientLng,
+          threadId: contextId,
+          existingDraft,
         },
       });
+      if (result?.draft) await persistTripDraft(authUser, contextId, result.draft);
+      if (result?.assistantResponse) {
+        return reply.send(result.assistantResponse);
+      }
       if (result?.assistantMessage) {
         return reply.send({
           assistantMessage: result.assistantMessage,
           planId: result.plan?.id,
-          tripId: result.tripId,
+          tripId: result.tripId || plannerTripId,
+          thread_id: contextId,
         });
       }
     }
 
     if (effectiveIntent.tripPlan) {
+      const parsedDates = parseDateRangeFromText(message);
+      let plannerTripId = tripId || null;
+      try {
+        plannerTripId = await ensurePlannerTripForMessage({
+          authUser,
+          tripId,
+          createTripPrefs: createTripPrefs || ctx?.createTripPrefs || null,
+          destinationLabel:
+            createTripPrefs?.destination ||
+            detectLocationInMessage(message) ||
+            detectStandaloneLocationReply(message) ||
+            ctx.location ||
+            null,
+          startDate: createTripPrefs?.startDate || parsedDates?.startDate || null,
+          endDate: createTripPrefs?.endDate || parsedDates?.endDate || null,
+        });
+      } catch (err) {
+        const messageText = err?.message ?? String(err);
+        return reply.code(500).send({ error: messageText });
+      }
+
       const result = await buildTripPlanFromPrompt({
         promptText: message,
-        tripId,
+        tripId: plannerTripId,
         authUser,
         overrides: {
           destinationLabel: createTripPrefs?.destination || undefined,
           startDate: createTripPrefs?.startDate || null,
           endDate: createTripPrefs?.endDate || null,
           userPrefs: createTripPrefs || ctx?.createTripPrefs || undefined,
+          clientLat,
+          clientLng,
+          threadId: contextId,
+          existingDraft,
         },
       });
+      if (result?.draft) await persistTripDraft(authUser, contextId, result.draft);
       if (result?.assistantMessage) {
         if (result?.error === "missing_dates" || result?.error === "missing_destination") {
           setAssistantContext(authUser, contextId, {
             pendingPlan: {
               promptText: message,
-              destinationLabel: detectLocationInMessage(message) || ctx.location || null,
+              destinationLabel:
+                createTripPrefs?.destination ||
+                detectLocationInMessage(message) ||
+                detectStandaloneLocationReply(message) ||
+                ctx.location ||
+                null,
+              startDate: createTripPrefs?.startDate || parsedDates?.startDate || null,
+              endDate: createTripPrefs?.endDate || parsedDates?.endDate || null,
               userPrefs: effectiveUserPrefs,
             },
           });
         }
+        if (result?.assistantResponse) {
+          return reply.send(result.assistantResponse);
+        }
         return reply.send({
           assistantMessage: result.assistantMessage,
           planId: result.plan?.id,
-          tripId: result.tripId,
+          tripId: result.tripId || plannerTripId,
+          thread_id: contextId,
         });
       }
     }
@@ -2342,6 +4302,11 @@ export async function assistantRoutes(app) {
         pendingIntent: null,
         lastIntent: "hotels",
         location: destination?.label || cityText,
+        lastHotel: {
+          city: destination?.label || cityText,
+          checkIn: checkIn || null,
+          checkOut: checkOut || null,
+        },
       });
       return reply.send({
         assistantMessage: `Here are a few hotel options in ${destination?.label || cityText}.`,
@@ -2411,6 +4376,11 @@ export async function assistantRoutes(app) {
           pendingIntent: null,
           lastIntent: isRestaurantIntent ? "restaurants" : "spots",
           location: locationText,
+          lastPlaces: {
+            category: isRestaurantIntent ? "restaurants" : "spots",
+            location: locationText,
+            openNow: Boolean(modifiers?.openNow),
+          },
         });
       }
       return reply.send(payload);
@@ -2561,15 +4531,26 @@ export async function assistantRoutes(app) {
       });
     }
 
-    let parsed = parseRoute(message);
+    const initialParsed = parseRoute(message);
+    const hasFlightContext = Boolean(ctx?.lastFlight?.fromText && ctx?.lastFlight?.toText);
+    const flightFollowupIntent =
+      !initialParsed &&
+      messageMentionsFlightAdjustment(message) &&
+      (ctx?.lastIntent === "flights" || ctx?.pendingIntent === "flights" || hasFlightContext);
+    let parsed = initialParsed;
+    if (!parsed && flightFollowupIntent && ctx?.lastFlight?.fromText && ctx?.lastFlight?.toText) {
+      parsed = { fromText: ctx.lastFlight.fromText, toText: ctx.lastFlight.toText };
+      const toOnly = parseFlightDestinationOnly(message);
+      if (toOnly) parsed.toText = toOnly;
+    }
     if (!parsed && ctx?.travelMode === "drive") {
       return reply.send({
         assistantMessage:
           "Got it — driving. Want hotels, restaurants, or things to do in your destination?",
       });
     }
-    if (!effectiveIntent.flights && !parsed) {
-      const llm = await classifyAssistantIntent(message);
+    if (!effectiveIntent.flights && !parsed && !flightFollowupIntent) {
+      const llm = await classifyAssistantIntent(contextualMessage);
       if (llm && llm.confidence >= 0.65) {
         if (llm.intent === "trip_plan") {
           const result = await buildTripPlanFromPrompt({
@@ -2578,18 +4559,27 @@ export async function assistantRoutes(app) {
             authUser,
             overrides: {
               destinationLabel: llm.location || undefined,
+              clientLat,
+              clientLng,
+              threadId: contextId,
+              existingDraft,
             },
           });
+          if (result?.draft) await persistTripDraft(authUser, contextId, result.draft);
           setAssistantContext(authUser, contextId, {
             pendingIntent: result?.error === "missing_dates" || result?.error === "missing_destination"
               ? "trip_plan"
               : null,
           });
+          if (result?.assistantResponse) {
+            return reply.send(result.assistantResponse);
+          }
           if (result?.assistantMessage) {
             return reply.send({
               assistantMessage: result.assistantMessage,
               planId: result.plan?.id,
               tripId: result.tripId,
+              thread_id: contextId,
             });
           }
         }
@@ -2620,6 +4610,11 @@ export async function assistantRoutes(app) {
             pendingIntent: null,
             lastIntent: llm.intent,
             location: llm.location || ctx.location || null,
+            lastPlaces: {
+              category: llm.intent === "restaurants" ? "restaurants" : "spots",
+              location: llm.location || ctx.location || null,
+              openNow: Boolean(llm.openNow),
+            },
           });
           return reply.send(payload);
         }
@@ -2654,6 +4649,11 @@ export async function assistantRoutes(app) {
     }
 
     if (!parsed) parsed = parseRoute(message);
+    if (!parsed && hasFlightContext) {
+      parsed = { fromText: ctx.lastFlight.fromText, toText: ctx.lastFlight.toText };
+      const toOnly = parseFlightDestinationOnly(message);
+      if (toOnly) parsed.toText = toOnly;
+    }
     if (!parsed?.fromText || !parsed?.toText) {
       setAssistantContext(authUser, contextId, { pendingIntent: "flights" });
       return reply.send({ assistantMessage: "From where to where?" });
@@ -2676,12 +4676,36 @@ export async function assistantRoutes(app) {
       return reply.send({ assistantMessage: "From where to where?" });
     }
 
-    const timeWindow = getTimeWindow(message);
+    const parsedTimeWindow = getTimeWindow(message);
+    const timeWindow =
+      parsedTimeWindow !== "any"
+        ? parsedTimeWindow
+        : ctx?.lastIntent === "flights" && ctx?.lastFlight?.timeWindow
+          ? ctx.lastFlight.timeWindow
+          : "any";
+    const wantsRoundTrip = messageWantsRoundTrip(message);
+    const wantsOneWay = messageWantsOneWay(message);
     let departDate;
     let returnDate;
+    const parsedDatesFromMessage = parseDateRangeFromText(message);
     let resolvedTripId = tripId || null;
 
-    if (tripId) {
+    if (parsedDatesFromMessage?.startDate) {
+      departDate = parsedDatesFromMessage.startDate;
+      returnDate = wantsRoundTrip
+        ? parsedDatesFromMessage.endDate ||
+          toDateString(addDays(new Date(parsedDatesFromMessage.startDate), 3))
+        : null;
+    } else if (ctx?.lastIntent === "flights" && ctx?.lastFlight?.departDate) {
+      departDate = ctx.lastFlight.departDate;
+      returnDate = ctx.lastFlight.returnDate || null;
+      if (wantsRoundTrip && !returnDate) {
+        returnDate = toDateString(addDays(new Date(departDate), 3));
+      }
+      if (wantsOneWay) {
+        returnDate = null;
+      }
+    } else if (tripId) {
       const { data, error } = await supabaseAdmin
         .from("trips")
         .select("start_date,end_date")
@@ -2690,23 +4714,22 @@ export async function assistantRoutes(app) {
 
       if (!error && data) {
         departDate = data.start_date;
-        returnDate = data.end_date;
+        returnDate = wantsRoundTrip ? data.end_date : null;
       } else {
         resolvedTripId = null;
       }
     }
 
-    if (!resolvedTripId) {
-      const depart = addDays(new Date(), 30);
-      const ret = addDays(depart, 3);
-      departDate = toDateString(depart);
-      returnDate = toDateString(ret);
+    if (!departDate) {
+      const fallback = nextDefaultDateRange();
+      departDate = fallback.startDate;
+      returnDate = wantsRoundTrip ? fallback.endDate : null;
     }
     const resultRefId = resolvedTripId || workspaceId || null;
 
     let response;
     try {
-      const cacheKey = `chatFlights:${fromLoc.id}:${toLoc.id}:${departDate}:${returnDate}`;
+      const cacheKey = `chatFlights:${fromLoc.id}:${toLoc.id}:${departDate}:${returnDate || "oneway"}`;
       const cached = cacheGet(cacheKey);
       if (cached) {
         response = cached;
@@ -2840,6 +4863,17 @@ export async function assistantRoutes(app) {
       pendingIntent: null,
       lastIntent: "flights",
       location: parsed?.toText || ctx.location || null,
+      lastFlight: {
+        fromText: parsed?.fromText || null,
+        toText: parsed?.toText || null,
+        fromId: fromLoc.id || null,
+        toId: toLoc.id || null,
+        fromLabel: fromLoc.code || fromLoc.label || null,
+        toLabel: toLoc.code || toLoc.label || null,
+        departDate,
+        returnDate: returnDate || null,
+        timeWindow,
+      },
     });
     return reply.send({
       assistantMessage,

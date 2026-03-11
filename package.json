@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "smoke:attractions:markers": "node scripts/smokeAttractionsMarkers.mjs"
+    "smoke:attractions:markers": "node scripts/smokeAttractionsMarkers.mjs",
+    "stress:assistant:chat": "node scripts/stressAssistantChat.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^11.2.0",

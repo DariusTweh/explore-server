@@ -1,6 +1,7 @@
 import { requireAuth } from "../utils/requireAuth.js";
 import { supabaseAdmin } from "../utils/supabaseAdmin.js";
-import { generateChatReply } from "../utils/chatCompletion.js";
+import { buildThreadSummary, shouldRefreshSummary } from "../utils/threadMemory.js";
+import { runChatOrchestrator } from "../services/chatOrchestrator.js";
 
 function buildThreadTitle(content) {
   const words = String(content || "")
@@ -23,6 +24,54 @@ async function getOwnedThread(threadId, userId) {
 
   if (error) throw error;
   return data;
+}
+
+async function getThreadMessageCount(threadId, userId) {
+  const { count, error } = await supabaseAdmin
+    .from("chat_messages")
+    .select("id", { count: "exact", head: true })
+    .eq("thread_id", threadId)
+    .eq("user_id", userId);
+
+  if (error) throw error;
+  return Number(count || 0);
+}
+
+async function loadThreadSummary(threadId) {
+  const { data, error } = await supabaseAdmin
+    .from("thread_summaries")
+    .select("thread_id, summary_text, updated_at")
+    .eq("thread_id", threadId)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function upsertThreadSummary(threadId, summaryText) {
+  const payload = {
+    thread_id: threadId,
+    summary_text: String(summaryText || ""),
+  };
+  const { data, error } = await supabaseAdmin
+    .from("thread_summaries")
+    .upsert(payload, { onConflict: "thread_id" })
+    .select("thread_id, summary_text, updated_at")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function touchThread(threadId, userId, preview) {
+  const patch = {
+    last_message_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    last_message_preview: String(preview || "").slice(0, 180),
+  };
+  await supabaseAdmin
+    .from("chat_threads")
+    .update(patch)
+    .eq("id", threadId)
+    .eq("user_id", userId);
 }
 
 export async function chatsRoutes(app) {
@@ -153,6 +202,35 @@ export async function chatsRoutes(app) {
     return reply.send(data);
   });
 
+  app.delete("/:threadId", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+
+    const { threadId } = req.params;
+    const thread = await getOwnedThread(threadId, authUser.id);
+    if (!thread) {
+      return reply.code(404).send({ error: "Chat not found" });
+    }
+
+    const messageCount = await getThreadMessageCount(threadId, authUser.id);
+    if (messageCount > 0) {
+      return reply.send({ deleted: false });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("chat_threads")
+      .delete()
+      .eq("id", threadId)
+      .eq("user_id", authUser.id);
+
+    if (error) {
+      req.log.error({ error }, "delete empty chat thread failed");
+      return reply.code(500).send({ error: "Failed to delete chat thread" });
+    }
+
+    return reply.send({ deleted: true });
+  });
+
   app.post("/:threadId/send", async (req, reply) => {
     const authUser = await requireAuth(req, reply);
     if (!authUser) return;
@@ -181,24 +259,16 @@ export async function chatsRoutes(app) {
       return reply.code(500).send({ error: "Failed to save message" });
     }
 
-    const { data: history, error: historyError } = await supabaseAdmin
-      .from("chat_messages")
-      .select("role, content, created_at")
-      .eq("thread_id", threadId)
-      .eq("user_id", authUser.id)
-      .order("created_at", { ascending: false })
-      .limit(20);
-
-    if (historyError) {
-      req.log.error({ error: historyError }, "load chat history failed");
-      return reply.code(500).send({ error: "Failed to build assistant context" });
-    }
-
-    let assistantReply;
+    let orchestration;
     try {
-      assistantReply = await generateChatReply((Array.isArray(history) ? history : []).reverse());
+      orchestration = await runChatOrchestrator({
+        threadId,
+        userId: authUser.id,
+        latestUserMessage: content,
+        logger: req.log,
+      });
     } catch (error) {
-      req.log.error({ error }, "assistant chat completion failed");
+      req.log.error({ error }, "chat orchestration failed");
       return reply.code(502).send({ error: "Could not get response. Try again." });
     }
 
@@ -208,15 +278,37 @@ export async function chatsRoutes(app) {
         thread_id: threadId,
         user_id: authUser.id,
         role: "assistant",
-        content: assistantReply,
+        content: orchestration.assistantMessage,
       })
-      .select("role, content, created_at")
+      .select("id, role, content, created_at")
       .single();
 
     if (assistantInsertError) {
       req.log.error({ error: assistantInsertError }, "save assistant chat message failed");
       return reply.code(500).send({ error: "Failed to save assistant response" });
     }
+
+    let nextSummary = orchestration.summaryText || "";
+    try {
+      const messageCount = await getThreadMessageCount(threadId, authUser.id);
+      const latestSummaryRow = await loadThreadSummary(threadId);
+
+      const refreshSummary = shouldRefreshSummary({
+        messageCount,
+        majorChanged: orchestration.memoryMajorChanged,
+        existingSummary: latestSummaryRow?.summary_text || orchestration.summaryText || "",
+      });
+      if (refreshSummary) {
+        nextSummary = buildThreadSummary(orchestration.memory || {});
+        await upsertThreadSummary(threadId, nextSummary);
+      } else {
+        nextSummary = latestSummaryRow?.summary_text || orchestration.summaryText || "";
+      }
+    } catch (error) {
+      req.log.warn({ error }, "thread summary refresh failed");
+    }
+
+    await touchThread(threadId, authUser.id, orchestration.assistantMessage);
 
     if (!thread.title) {
       const title = buildThreadTitle(content);
@@ -234,11 +326,18 @@ export async function chatsRoutes(app) {
     }
 
     return reply.send({
+      threadId,
       assistantMessage: {
+        id: assistantMessage.id,
         role: "assistant",
         content: assistantMessage.content,
         created_at: assistantMessage.created_at,
       },
+      context: orchestration.context,
+      memory: orchestration.memory,
+      cards: orchestration.cards,
+      summary: nextSummary,
+      uiHints: orchestration.uiHints,
     });
   });
 }

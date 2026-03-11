@@ -5,6 +5,53 @@ import { geocodeMapbox } from "../utils/geocodeMapbox.js";
 import { bookingGet } from "../utils/bookingClient.js";
 import { placesDetailsNew } from "../utils/googlePlaces.js";
 
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+function extractPlanThumbnail(planJson) {
+  const fromHotel = firstNonEmptyString(planJson?.selectedHotel?.image_url, planJson?.selectedHotel?.imageUrl);
+  if (fromHotel) return fromHotel;
+
+  const days = Array.isArray(planJson?.days) ? planJson.days : [];
+  for (const day of days) {
+    const items = Array.isArray(day?.items) ? day.items : [];
+    for (const item of items) {
+      const candidate = firstNonEmptyString(
+        item?.imageUrl,
+        item?.image_url,
+        item?.photoUrl,
+        item?.photo_url,
+        item?.meta?.imageUrl,
+        item?.meta?.image_url
+      );
+      if (candidate) return candidate;
+    }
+  }
+  return null;
+}
+
+function mapTripSummary(row, lastThreadId = null, thumbnailUrl = null) {
+  return {
+    id: row?.id || null,
+    title: row?.title || null,
+    primary_location_name: row?.primary_location_name || null,
+    start_date: row?.start_date || null,
+    end_date: row?.end_date || null,
+    planning_state: row?.planning_state || "confirmed",
+    locked_at: row?.locked_at || null,
+    locked_plan_id: row?.locked_plan_id || null,
+    confirmed_at: row?.confirmed_at || null,
+    updated_at: row?.updated_at || row?.created_at || null,
+    last_thread_id: lastThreadId || null,
+    thumbnail_url: thumbnailUrl || null,
+  };
+}
+
 function pickAttractionCoords(details) {
   const addresses = details?.addresses || {};
   const priority = [
@@ -135,6 +182,87 @@ async function hydrateCoordsForItem(item, destinationLabel) {
 }
 
 export async function tripsRoutes(app) {
+  app.get("/", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+
+    const planningStateRaw = String(req.query?.planning_state || "").trim().toLowerCase();
+    const planningState =
+      planningStateRaw === "draft" || planningStateRaw === "unconfirmed" || planningStateRaw === "confirmed"
+        ? planningStateRaw
+        : null;
+
+    let tripsQuery = supabaseAdmin
+      .from("trips")
+      .select(
+        "id,title,primary_location_name,start_date,end_date,planning_state,locked_at,locked_plan_id,confirmed_at,created_at"
+      )
+      .eq("user_id", authUser.id)
+      .order("created_at", { ascending: false });
+
+    if (planningState) {
+      tripsQuery = tripsQuery.eq("planning_state", planningState);
+    } else {
+      tripsQuery = tripsQuery.neq("planning_state", "draft");
+    }
+
+    const { data: tripRows, error: tripsError } = await tripsQuery;
+    if (tripsError) {
+      return reply.code(500).send({ error: tripsError.message });
+    }
+
+    const trips = Array.isArray(tripRows) ? tripRows : [];
+    if (!trips.length) return reply.send({ trips: [] });
+
+    const tripIds = trips.map((trip) => trip?.id).filter(Boolean);
+    const lastThreadByTripId = new Map();
+    const latestPlanByTripId = new Map();
+    const planById = new Map();
+    if (tripIds.length) {
+      const { data: draftRows } = await supabaseAdmin
+        .from("assistant_trip_drafts")
+        .select("trip_id, thread_id, created_at")
+        .eq("user_id", authUser.id)
+        .in("trip_id", tripIds)
+        .order("created_at", { ascending: false });
+
+      for (const row of Array.isArray(draftRows) ? draftRows : []) {
+        const tripId = String(row?.trip_id || "");
+        if (!tripId || lastThreadByTripId.has(tripId)) continue;
+        const threadId = String(row?.thread_id || "").trim();
+        if (threadId) lastThreadByTripId.set(tripId, threadId);
+      }
+
+      const { data: planRows } = await supabaseAdmin
+        .from("trip_plans")
+        .select("id,trip_id,plan_json,created_at")
+        .in("trip_id", tripIds)
+        .order("created_at", { ascending: false });
+
+      for (const row of Array.isArray(planRows) ? planRows : []) {
+        const tripId = String(row?.trip_id || "");
+        if (!tripId) continue;
+        const planId = String(row?.id || "");
+        if (planId) planById.set(planId, row);
+        if (!latestPlanByTripId.has(tripId)) latestPlanByTripId.set(tripId, row);
+      }
+    }
+
+    return reply.send({
+      trips: trips.map((row) => {
+        const tripId = String(row?.id || "");
+        const lockedPlanId = String(row?.locked_plan_id || "");
+        const preferredPlan = (lockedPlanId && planById.get(lockedPlanId)) || latestPlanByTripId.get(tripId) || null;
+        const thumbnailUrl = extractPlanThumbnail(preferredPlan?.plan_json || null);
+        return mapTripSummary(
+          row,
+          lastThreadByTripId.get(tripId) || null,
+          thumbnailUrl
+        );
+      }),
+    });
+  });
+
   app.post("/", async (req, reply) => {
     const authUser = await requireAuth(req, reply);
     if (!authUser) return;
@@ -163,6 +291,8 @@ export async function tripsRoutes(app) {
         budget_tier: budgetTier,
         road_trip: roadTrip,
         title: tripTitle,
+        planning_state: "confirmed",
+        confirmed_at: new Date().toISOString(),
       })
       .select("*")
       .single();
@@ -191,6 +321,32 @@ export async function tripsRoutes(app) {
     }
 
     return reply.send({ trip: data });
+  });
+
+  app.post("/:tripId/confirm", async (req, reply) => {
+    const authUser = await requireAuth(req, reply);
+    if (!authUser) return;
+
+    const { tripId } = req.params || {};
+    const now = new Date().toISOString();
+    const { data, error } = await supabaseAdmin
+      .from("trips")
+      .update({
+        planning_state: "confirmed",
+        confirmed_at: now,
+      })
+      .eq("id", tripId)
+      .eq("user_id", authUser.id)
+      .select(
+        "id,title,primary_location_name,start_date,end_date,planning_state,locked_at,locked_plan_id,confirmed_at,created_at"
+      )
+      .single();
+
+    if (error || !data) {
+      return reply.code(404).send({ error: "Trip not found" });
+    }
+
+    return reply.send({ ok: true, trip: mapTripSummary(data, null) });
   });
 
   app.get("/:tripId/saved", async (req, reply) => {

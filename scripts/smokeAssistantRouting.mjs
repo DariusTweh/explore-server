@@ -141,6 +141,42 @@ function messageMentionsFlights(message) {
   return FLIGHT_KEYWORDS.some((kw) => text.includes(kw));
 }
 
+function messageWantsRoundTrip(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("round trip") ||
+    text.includes("roundtrip") ||
+    text.includes("return flight") ||
+    text.includes("return flights") ||
+    text.includes("returning") ||
+    text.includes("with return") ||
+    text.includes("back on")
+  );
+}
+
+function messageWantsOneWay(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return text.includes("one way") || text.includes("one-way") || text.includes("oneway");
+}
+
+function messageMentionsFlightAdjustment(message) {
+  const text = (message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    messageWantsRoundTrip(text) ||
+    messageWantsOneWay(text) ||
+    text.includes("keep same date") ||
+    text.includes("keep same dates") ||
+    text.includes("same dates") ||
+    text.includes("switch destination") ||
+    text.includes("change destination") ||
+    text.includes("make it") ||
+    text.includes("instead")
+  );
+}
+
 function messageMentionsTripPlan(message) {
   const text = (message || "").toLowerCase();
   return PLAN_KEYWORDS.some((kw) => text.includes(kw));
@@ -149,6 +185,8 @@ function messageMentionsTripPlan(message) {
 function detectLocationInMessage(message) {
   const text = (message || "").toLowerCase();
   const patterns = [
+    /\b(?:what about)\s+([a-z\s'-]{2,})/i,
+    /\b(?:where is|where's|tell me about)\s+([a-z\s'-]{2,})/i,
     /\b(?:going to|traveling to|trip to|heading to|visiting|visit)\s+([a-z\s'-]{2,})/i,
     /\b(?:in|around|near|at)\s+([a-z\s'-]{2,})/i,
   ];
@@ -170,6 +208,15 @@ function detectTravelMode(message) {
   return null;
 }
 
+function applyContextualLocationHint(message, location) {
+  const text = String(message || "");
+  const loc = String(location || "").trim();
+  if (!text || !loc) return text;
+  if (!/\bthere\b/i.test(text)) return text;
+  if (detectLocationInMessage(text)) return text;
+  return text.replace(/\bthere\b/gi, `in ${loc}`);
+}
+
 function isFollowupReply(message) {
   const text = String(message || "").trim().toLowerCase();
   if (!text) return false;
@@ -186,6 +233,18 @@ function isFollowupReply(message) {
     "sightseeing",
   ];
   return genericFollowups.some((phrase) => text.includes(phrase));
+}
+
+function messageLooksGeneralInfoQuestion(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  const questionLead = /^(what|which|who|where|when|why|how)\b/i.test(text);
+  const infoSignals =
+    /\b(currency|language|timezone|time zone|weather|population|capital|visa|religion|culture)\b/i.test(
+      text
+    );
+  const hasRouteSignal = /\bfrom\s+.+\s+to\s+.+\b/i.test(text);
+  return (questionLead || infoSignals) && !hasRouteSignal;
 }
 
 function normalizePendingIntent(value) {
@@ -221,7 +280,8 @@ function getEffectiveIntent(message, ctx) {
     !explicit.activities &&
     !explicit.flights &&
     pendingIntent &&
-    isFollowupReply(message)
+    isFollowupReply(message) &&
+    !messageLooksGeneralInfoQuestion(message)
   ) {
     if (pendingIntent === "restaurants") explicit.restaurants = true;
     if (pendingIntent === "spots") explicit.spots = true;
@@ -233,30 +293,63 @@ function getEffectiveIntent(message, ctx) {
   return explicit;
 }
 
+function cleanRouteEndpoint(text) {
+  if (!text) return "";
+  return trimTemporalLocationSuffix(sanitizeLocationText(text))
+    .replace(
+      /\b(next|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*$/i,
+      ""
+    )
+    .replace(
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b.*$/i,
+      ""
+    )
+    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b.*$/i, "")
+    .replace(/\b(?:on|for|during|leaving|departing)\b.*$/i, "")
+    .trim();
+}
+
 function parseRoute(message) {
   const text = (message || "").toLowerCase();
   const fromToMatch = text.match(/from\s+(.+?)\s+to\s+(.+)/i);
   if (fromToMatch) {
     return {
-      fromText: sanitizeLocationText(fromToMatch[1].trim()),
-      toText: sanitizeLocationText(fromToMatch[2].trim()),
+      fromText: cleanRouteEndpoint(fromToMatch[1].trim()),
+      toText: cleanRouteEndpoint(fromToMatch[2].trim()),
     };
   }
   return null;
 }
 
+function parseFlightDestinationOnly(message) {
+  const text = (message || "").toLowerCase();
+  const match = text.match(
+    /\b(?:to|destination(?:\s+to)?|switch destination to|change destination to)\s+([a-z\s'-]{2,})/i
+  );
+  if (!match?.[1]) return null;
+  return cleanRouteEndpoint(match[1]);
+}
+
 function parseHotelCity(message) {
   const text = (message || "").toLowerCase();
+  const cleanHotelCity = (value) =>
+    trimTemporalLocationSuffix(sanitizeLocationText(value))
+      .replace(
+        /\b(?:find|show|book|need|looking|search|with|for|please|can you|could you|help me)\b.*$/i,
+        ""
+      )
+      .replace(/\b(?:near|close to)\s+transit\b.*$/i, "")
+      .trim();
   const inMatch = text.match(/(?:hotel|hotels|stay|stays|accommodation|lodging)\s+in\s+(.+)/i);
-  if (inMatch) return trimTemporalLocationSuffix(sanitizeLocationText(inMatch[1]));
+  if (inMatch) return cleanHotelCity(inMatch[1]);
   const atMatch = text.match(/(?:hotel|hotels|stay|stays|accommodation|lodging)\s+at\s+(.+)/i);
-  if (atMatch) return trimTemporalLocationSuffix(sanitizeLocationText(atMatch[1]));
+  if (atMatch) return cleanHotelCity(atMatch[1]);
   const stayingMatch = text.match(/(?:staying(?:\s+in)?|stay\s+in)\s+(.+)/i);
-  if (stayingMatch) return trimTemporalLocationSuffix(sanitizeLocationText(stayingMatch[1]));
+  if (stayingMatch) return cleanHotelCity(stayingMatch[1]);
   const nearMatch = text.match(
     /(?:hotel|hotels|stay|stays|staying|accommodation|lodging)\s+(?:near|around)\s+(.+)/i
   );
-  if (nearMatch) return trimTemporalLocationSuffix(sanitizeLocationText(nearMatch[1]));
+  if (nearMatch) return cleanHotelCity(nearMatch[1]);
   return null;
 }
 
@@ -287,8 +380,18 @@ function parseSpotLocation(message) {
   if (fromActivity) return fromActivity;
   const text = (message || "").toLowerCase();
   if (text.includes("near me") || text.includes("nearby")) return null;
-  const generic = text.match(/\b(?:in|near|around|at|by)\s+([a-z\s'-]{2,})$/i);
-  if (generic?.[1]) return sanitizeLocationText(generic[1]);
+  const cleanSpotLocation = (value) =>
+    sanitizeLocationText(value)
+      .replace(/\b(?:open now|late night|24 hours?)\b.*$/i, "")
+      .trim();
+  const generic = text.match(
+    /\b(?:in|near|around|at|by)\s+([a-z\s'-]{2,})(?:\s+(?:open now|late night|24 hours?))?$/i
+  );
+  if (generic?.[1]) return cleanSpotLocation(generic[1]);
+  const midSentence = text.match(
+    /\b(?:in|near|around|at|by)\s+([a-z\s'-]{2,}?)(?=\s+\b(?:open now|late night|24 hours?|with|for|please|find|show|search)\b|$)/i
+  );
+  if (midSentence?.[1]) return cleanSpotLocation(midSentence[1]);
   return null;
 }
 
@@ -316,6 +419,11 @@ const cases = [
     expect: "miami",
   },
   {
+    label: "hotel city parses staying clause with follow-up request",
+    run: () => parseHotelCity("I’m staying in Kyoto, find me boutique hotels near transit"),
+    expect: "kyoto",
+  },
+  {
     label: "activity city parses around",
     run: () => parseActivityLocation("best things to do around Tokyo"),
     expect: "tokyo",
@@ -329,6 +437,31 @@ const cases = [
     label: "simple flight keyword routes to flights",
     run: () => messageMentionsFlights("show me flights to lax"),
     expect: true,
+  },
+  {
+    label: "one-way by default when return is not requested",
+    run: () => messageWantsRoundTrip("show me flights from sfo to jfk"),
+    expect: false,
+  },
+  {
+    label: "round-trip is detected when explicitly requested",
+    run: () => messageWantsRoundTrip("show me round trip flights from sfo to jfk"),
+    expect: true,
+  },
+  {
+    label: "flight follow-up adjustment intent is detected",
+    run: () => messageMentionsFlightAdjustment("make it a round trip instead"),
+    expect: true,
+  },
+  {
+    label: "flight destination-only update parses",
+    run: () => parseFlightDestinationOnly("Actually switch destination to BOS"),
+    expect: "bos",
+  },
+  {
+    label: "flight destination-only update is not parsed as full route",
+    run: () => parseRoute("Actually switch destination to BOS and keep the same dates"),
+    expect: null,
   },
   {
     label: "early morning maps to early_morning time window",
@@ -349,6 +482,11 @@ const cases = [
     label: "flight route strips filler",
     run: () => parseRoute("can you find me a flight from nyc to lax please"),
     expect: { fromText: "nyc", toText: "lax" },
+  },
+  {
+    label: "flight route strips day suffix from destination",
+    run: () => parseRoute("Find me early morning flights from SFO to JFK next Friday"),
+    expect: { fromText: "sfo", toText: "jfk" },
   },
   {
     label: "hotel city parses hotel in phrase",
@@ -401,6 +539,11 @@ const cases = [
     expect: "chicago",
   },
   {
+    label: "spot location parses city with open-now suffix",
+    run: () => parseSpotLocation("find sushi restaurants in tokyo open now"),
+    expect: "tokyo",
+  },
+  {
     label: "spot location returns null for near me",
     run: () => parseSpotLocation("find pharmacies near me"),
     expect: null,
@@ -426,6 +569,21 @@ const cases = [
     expect: "barcelona in june",
   },
   {
+    label: "where is phrasing sets location context",
+    run: () => detectLocationInMessage("Where is Bali"),
+    expect: "bali",
+  },
+  {
+    label: "what about phrasing sets new location context",
+    run: () => detectLocationInMessage("Hmm what about Senegal"),
+    expect: "senegal",
+  },
+  {
+    label: "contextual there resolves to previous location",
+    run: () => applyContextualLocationHint("What is the local language there?", "Bali"),
+    expect: "What is the local language in Bali?",
+  },
+  {
     label: "drive mode detected",
     run: () => detectTravelMode("we are driving from la to san diego"),
     expect: "drive",
@@ -449,6 +607,11 @@ const cases = [
     label: "generic followup inherits activities intent",
     run: () => getEffectiveIntent("nothing specific just find me something", { pendingIntent: "activities" }).activities,
     expect: true,
+  },
+  {
+    label: "info question does not inherit pending flights intent",
+    run: () => getEffectiveIntent("What is the currency compared to the US", { pendingIntent: "flights" }).flights,
+    expect: false,
   },
   {
     label: "followup does not inherit without pending intent",

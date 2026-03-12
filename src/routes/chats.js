@@ -47,6 +47,44 @@ async function loadThreadSummary(threadId) {
   return data || null;
 }
 
+async function loadRecentMessages(threadId, userId, limit = 20) {
+  const { data, error } = await supabaseAdmin
+    .from("chat_messages")
+    .select("role, content, created_at")
+    .eq("thread_id", threadId)
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return (Array.isArray(data) ? data : []).reverse();
+}
+
+async function loadThreadMemory(threadId, userId) {
+  const { data, error } = await supabaseAdmin
+    .from("thread_memory")
+    .select("thread_id, user_id, memory_json, updated_at")
+    .eq("thread_id", threadId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function upsertThreadMemory(threadId, userId, memory) {
+  const payload = {
+    thread_id: threadId,
+    user_id: userId,
+    memory_json: memory || {},
+  };
+  const { data, error } = await supabaseAdmin
+    .from("thread_memory")
+    .upsert(payload, { onConflict: "thread_id" })
+    .select("thread_id, user_id, memory_json, updated_at")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 async function upsertThreadSummary(threadId, summaryText) {
   const payload = {
     thread_id: threadId,
@@ -59,6 +97,10 @@ async function upsertThreadSummary(threadId, summaryText) {
     .single();
   if (error) throw error;
   return data;
+}
+
+async function touchThreadOnUserSend(threadId, userId, preview) {
+  return touchThread(threadId, userId, preview);
 }
 
 async function touchThread(threadId, userId, preview) {
@@ -259,14 +301,27 @@ export async function chatsRoutes(app) {
       return reply.code(500).send({ error: "Failed to save message" });
     }
 
+    await touchThreadOnUserSend(threadId, authUser.id, content);
+
     let orchestration;
     try {
+      const [recentMessages, memoryRow, summaryRow] = await Promise.all([
+        loadRecentMessages(threadId, authUser.id, 20),
+        loadThreadMemory(threadId, authUser.id),
+        loadThreadSummary(threadId),
+      ]);
+
       orchestration = await runChatOrchestrator({
         threadId,
         userId: authUser.id,
         latestUserMessage: content,
+        recentMessages,
+        previousMemory: memoryRow?.memory_json || {},
+        threadSummary: summaryRow?.summary_text || "",
         logger: req.log,
       });
+
+      await upsertThreadMemory(threadId, authUser.id, orchestration.memory || {});
     } catch (error) {
       req.log.error({ error }, "chat orchestration failed");
       return reply.code(502).send({ error: "Could not get response. Try again." });
@@ -333,6 +388,7 @@ export async function chatsRoutes(app) {
         content: assistantMessage.content,
         created_at: assistantMessage.created_at,
       },
+      assistantText: assistantMessage.content,
       context: orchestration.context,
       memory: orchestration.memory,
       cards: orchestration.cards,

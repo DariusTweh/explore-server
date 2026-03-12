@@ -3797,6 +3797,9 @@ function tuneDraftForMuseums(draft) {
 }
 
 
+// Legacy non-threaded assistant routes.
+// Private 1:1 chat should use /api/chats exclusively; keep this router only for
+// trip-draft generation, assistant action endpoints, and transitional planner flows.
 export async function assistantRoutes(app) {
   app.post("/plan", async (req, reply) => {
     const authUser = await requireAuth(req, reply);

@@ -27,6 +27,12 @@ function fallbackReply({ memory, toolContext }) {
   const task = toolContext?.task || memory?.last_task || "answer_general_travel_question";
   const userQuery = String(toolContext?.userQuery || "").trim();
 
+  const flightTimeQuestion = /\b(avg flight time|average flight time|flight time|how long is the flight|how long is a flight)\b/i.test(
+    userQuery
+  );
+  const cruisePassportQuestion = /\bcruise\b/i.test(userQuery) && /\bpassport\b/i.test(userQuery);
+  const passportQuestion = /\b(passport requirements?|do i need a passport|need a passport)\b/i.test(userQuery);
+
   if (mode === "place_lookup") {
     const place = toolContext?.resolvedPlace?.label || memory?.active_place?.label || "that place";
     const top = Array.isArray(toolContext?.attractionResults) ? toolContext.attractionResults[0] : null;
@@ -49,7 +55,7 @@ function fallbackReply({ memory, toolContext }) {
     const dest = memory?.destination?.label || toolContext?.destinationHint || "your destination";
     const names = (toolContext?.attractionResults || []).slice(0, 4).map((x) => x?.name).filter(Boolean);
     if (names.length) return `Top places in ${dest}: ${names.join(", ")}.`;
-    return `I can help with top places, neighborhoods, and things to do in ${dest}.`;
+    return `${dest} is broad, but I can narrow it down fast. Tell me if you want big cities, food, nightlife, museums, nature, or a shorter regional list.`;
   }
 
   if (mode === "trip_planning") {
@@ -71,6 +77,28 @@ function fallbackReply({ memory, toolContext }) {
     const mentionsNationality = /\bpassport\b|\bi am\b|\bamerican\b|\bcanadian\b|\buk\b|\bindian\b|\baustralian\b/i.test(userQuery);
     const asksCurrency = /\bcurrency|exchange rate|exchange\b/i.test(userQuery);
 
+    if (flightTimeQuestion) {
+      const origin = memory?.origin?.label || null;
+      if (origin && subject) {
+        return `Flight time from ${origin} to ${subject} depends on the route, but nonstop flights are often around 8 to 12 hours. If you want, tell me the departure city and I’ll narrow it down.`;
+      }
+      if (subject) {
+        return `Flight time to ${subject} depends on where you leave from. From the U.S., nonstop flights are often roughly 8 to 11 hours from the East Coast and 10 to 12 hours from the West Coast.`;
+      }
+      return "Flight time depends on your departure city and whether the route is nonstop. Tell me the route and I’ll narrow it down.";
+    }
+
+    if (cruisePassportQuestion) {
+      if (subject) {
+        return `For a cruise to ${subject}, passport rules depend on the itinerary and whether it is a closed-loop cruise. A passport is usually the safest option. If you want, tell me the cruise start and end port.`;
+      }
+      return "For cruises, passport rules depend on the itinerary and whether it is a closed-loop cruise. A passport is usually the safest option. If you want, tell me the route.";
+    }
+
+    if (passportQuestion && !subject) {
+      return "Passport requirements depend on where you are going and how you are traveling. If you share the destination or route, I can narrow it down.";
+    }
+
     if (asksCurrency && subject) {
       return `They use the local currency in ${subject}. If you want, I can also help with exchange-rate context.`;
     }
@@ -78,7 +106,7 @@ function fallbackReply({ memory, toolContext }) {
       return `I can help with ${subject} entry rules. What passport are you traveling on?`;
     }
     if (subject) {
-      return `I can help with ${subject} travel questions like visas, entry rules, currency, safety, weather, flights, and hotels.`;
+      return `I can help with ${subject}. Tell me if you want visas, entry rules, currency, safety, weather, flights, or hotels.`;
     }
   }
 
@@ -86,6 +114,17 @@ function fallbackReply({ memory, toolContext }) {
 }
 
 export async function generateChatReply({ messages, threadSummary, memory, toolContext }) {
+  const userQuery = String(toolContext?.userQuery || "").trim();
+  const forceDeterministicKnowledgeReply =
+    toolContext?.mode === "travel_knowledge" &&
+    /\b(avg flight time|average flight time|flight time|how long is the flight|how long is a flight|passport requirements?|do i need a passport|need a passport|visa|entry|admission|immigration|tourist entry|border|arrival|cruise)\b/i.test(
+      userQuery
+    );
+
+  if (forceDeterministicKnowledgeReply) {
+    return fallbackReply({ memory, toolContext });
+  }
+
   if (!client) {
     return fallbackReply({ memory, toolContext });
   }

@@ -61,6 +61,7 @@ function sanitizeDestinationCandidate(value) {
     .replace(/[?.!,]$/g, "")
     .trim();
   if (!normalized) return null;
+  if (/^(that|this|it|there|here)$/i.test(normalized)) return null;
   if (normalized.length > 50) return null;
   if (isLikelyPoi(normalized)) return null;
   return normalized;
@@ -142,17 +143,20 @@ function extractKnowledgeSubject(text, memory = {}) {
   if (explicit) return explicit;
 
   const patterns = [
+    /\bcruise\s+to\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
+    /\bpassport requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
+    /\bdo i need a passport for\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
+    /\bfrom\s+([A-Za-z][A-Za-z\s'-]{1,40}|[A-Z]{2,3})\s+to\s+([A-Za-z][A-Za-z\s'-]{2,50}|[A-Z]{3})\b/i,
     /\b([A-Za-z][A-Za-z\s'-]{2,50})\s+(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\b/i,
     /\b(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bdo i need a visa for\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bcan i enter\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b(?:currency|safety|weather)\s+(?:in|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bwhat about\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
-    /\bfor\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
   ];
   for (const pattern of patterns) {
     const match = source.match(pattern);
-    const candidate = sanitizeDestinationCandidate(match?.[1]);
+    const candidate = sanitizeDestinationCandidate(match?.[2] || match?.[1]);
     if (candidate) return candidate;
   }
 
@@ -160,6 +164,14 @@ function extractKnowledgeSubject(text, memory = {}) {
     return memory.destination.label;
   }
   return null;
+}
+
+function shouldCarryKnowledgeDestination(text, memory = {}) {
+  const source = clean(text);
+  if (!hasKnowledgeContext(memory)) return false;
+  if (/^what about\b/i.test(source)) return true;
+  if (/you couldn't find it for\b/i.test(source)) return true;
+  return false;
 }
 
 function looksLikeActionFollowup(text) {
@@ -178,8 +190,12 @@ function isKnowledgeQuestion(text, memory = {}) {
   if (
     /\b(visa|entry|admission|immigration|tourist entry|border|arrival)\b/.test(raw) ||
     /\b(currency|exchange rate|exchange|safety|safe|weather)\b/.test(raw) ||
+    /\b(avg flight time|average flight time|flight time|how long is the flight|how long is a flight)\b/.test(raw) ||
+    /\bpassport requirements?\b/.test(raw) ||
+    /\bdo i need a passport\b/.test(raw) ||
     /\bdo i need a visa\b/.test(raw) ||
-    /\bcan i enter\b/.test(raw)
+    /\bcan i enter\b/.test(raw) ||
+    /\bcruise\b/.test(raw)
   ) {
     return true;
   }
@@ -192,8 +208,27 @@ function isKnowledgeQuestion(text, memory = {}) {
   return false;
 }
 
+function looksLikeFlightKnowledgeQuestion(text) {
+  return /\b(avg flight time|average flight time|flight time|how long is the flight|how long is a flight)\b/i.test(
+    String(text || "")
+  );
+}
+
+function looksLikePassportRequirementQuestion(text) {
+  return /\b(passport requirements?|do i need a passport|need a passport)\b/i.test(
+    String(text || "")
+  );
+}
+
+function looksLikeGeneralTravelDocsQuestion(text) {
+  return /\b(visa|entry|admission|immigration|tourist entry|border|arrival|passport)\b/i.test(
+    String(text || "")
+  );
+}
+
 function isActionIntent(text) {
   const raw = lower(text);
+  if (isKnowledgeQuestion(raw)) return false;
   return (
     /\b(show flights|flight options|book flight|compare hotels|show hotels|save this place|save place)\b/.test(raw) ||
     /\bfrom\s+[a-z]{3,40}\s+to\s+[a-z]{3,40}\b/.test(raw)
@@ -326,12 +361,20 @@ function determineIntentFromRules(message, memory = {}) {
   if (isKnowledgeQuestion(raw, memory)) {
     const knowledgeSubject = extractKnowledgeSubject(raw, memory);
     const currencyLike = /\bcurrency|exchange rate|exchange\b/i.test(raw);
+    const flightKnowledgeLike = looksLikeFlightKnowledgeQuestion(raw);
     return buildRuleClassification({
       intent: "chat",
       mode: "travel_knowledge",
-      task: currencyLike ? "answer_currency_question" : "answer_general_travel_question",
+      task:
+        currencyLike
+          ? "answer_currency_question"
+          : flightKnowledgeLike
+            ? "answer_flight_time_question"
+            : looksLikePassportRequirementQuestion(raw) || looksLikeGeneralTravelDocsQuestion(raw)
+              ? "answer_travel_docs_question"
+              : "answer_general_travel_question",
       query: raw,
-      destinationHint: knowledgeSubject || memory?.destination?.label || null,
+      destinationHint: knowledgeSubject || null,
       confidence: 0.92,
     });
   }
@@ -355,12 +398,20 @@ function determineIntentFromRules(message, memory = {}) {
 
 function postProcessClassification(data, memory, userMessage) {
   const next = { ...data };
-  next.destinationHint =
+  const explicitKnowledgeSubject = extractKnowledgeSubject(userMessage, memory);
+  const safeDestinationHint =
     sanitizeDestinationCandidate(next.destinationHint) ||
     extractDestinationHint(userMessage) ||
-    extractKnowledgeSubject(userMessage, memory) ||
-    memory?.destination?.label ||
+    explicitKnowledgeSubject ||
     null;
+
+  if (next.mode === "travel_knowledge") {
+    next.destinationHint =
+      safeDestinationHint ||
+      (shouldCarryKnowledgeDestination(userMessage, memory) ? memory?.destination?.label || null : null);
+  } else {
+    next.destinationHint = safeDestinationHint || memory?.destination?.label || null;
+  }
 
   if (next.mode === "place_lookup" || next.mode === "nearby_search") {
     next.query = extractPlaceSubject(next.query || userMessage) || clean(next.query || userMessage) || null;

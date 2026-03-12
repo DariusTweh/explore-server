@@ -123,7 +123,9 @@ function normalizeCandidateLabel(value) {
 
 function buildDestination(label, confidence = 0.8) {
   const normalized = normalizeCandidateLabel(label);
-  if (!normalized || isLikelyPoi(normalized)) return null;
+  if (!normalized || /^(that|this|it|there|here)$/i.test(normalized) || isLikelyPoi(normalized)) {
+    return null;
+  }
   const meta = DESTINATION_META[lower(normalized)] || null;
   return {
     label: titleCase(normalized),
@@ -466,8 +468,11 @@ export function extractDestinationFromMessage(message, classification = null) {
     /\bbest neighborhoods in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b(?:actually|instead)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b([A-Za-z][A-Za-z\s'-]{2,50})\s+trip\b/i,
+    /\bcruise\s+to\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
     /\b(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bpassport requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
     /\bdo i need a visa for\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bdo i need a passport for\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
     /\bwhat currency do they use in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
   ];
   for (const pattern of patterns) {
@@ -693,6 +698,18 @@ function hasExplicitDestinationSignal(message) {
   );
 }
 
+function isGeneralTravelDocsQuestion(message) {
+  return /\b(do i need a passport|passport requirements?|passport|visa|entry|admission|immigration|tourist entry|border|arrival|cruise)\b/i.test(
+    String(message || "")
+  );
+}
+
+function isFlightKnowledgeQuestion(message) {
+  return /\b(avg flight time|average flight time|flight time|how long is the flight|how long is a flight)\b/i.test(
+    String(message || "")
+  );
+}
+
 function collectSignals(message, classification = null) {
   const route = extractRouteFromMessage(message);
   const destination = extractDestinationFromMessage(message, classification);
@@ -812,6 +829,16 @@ export function resolveMemoryFromRecentMessages({
 
   if (!next.currency && next.destination) {
     next.currency = inferCurrencyFromDestination(next.destination);
+  }
+
+  if (
+    classification?.mode === "travel_knowledge" &&
+    !extractDestinationFromMessage(latestUserMessage, classification) &&
+    !extractRouteFromMessage(latestUserMessage) &&
+    (isGeneralTravelDocsQuestion(latestUserMessage) || isFlightKnowledgeQuestion(latestUserMessage))
+  ) {
+    next.destination = null;
+    next.currency = null;
   }
 
   if (shouldClearActivePlace({ classification, latestUserMessage })) {

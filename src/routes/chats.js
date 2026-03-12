@@ -391,7 +391,7 @@ export async function chatsRoutes(app) {
       assistantText: assistantMessage.content,
       context: orchestration.context,
       memory: orchestration.memory,
-      cards: orchestration.cards,
+      cards: Array.isArray(orchestration.cards) ? orchestration.cards : [],
       summary: nextSummary,
       uiHints: orchestration.uiHints,
     });

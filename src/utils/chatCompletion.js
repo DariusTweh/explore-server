@@ -1,6 +1,9 @@
 import OpenAI from "openai";
+import { getOpenAIModels } from "./openaiModels.js";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 function extractOutputText(resp) {
   const direct = String(resp?.output_text || "").trim();
@@ -22,6 +25,7 @@ function extractOutputText(resp) {
 function fallbackReply({ memory, toolContext }) {
   const mode = toolContext?.mode || memory?.last_mode || "travel_knowledge";
   const task = toolContext?.task || memory?.last_task || "answer_general_travel_question";
+  const userQuery = String(toolContext?.userQuery || "").trim();
 
   if (mode === "place_lookup") {
     const place = toolContext?.resolvedPlace?.label || memory?.active_place?.label || "that place";
@@ -29,7 +33,7 @@ function fallbackReply({ memory, toolContext }) {
     if (top?.name) {
       return `${top.name} appears to be the closest exact match for ${place}. Want nearby options next?`;
     }
-    return `I couldn't confirm an exact match for ${place} yet. Share the city or country and I'll refine it.`;
+    return `I’m not fully confident about ${place} yet. If you want, give me the city or country and I’ll narrow it down.`;
   }
 
   if (mode === "nearby_search") {
@@ -38,14 +42,14 @@ function fallbackReply({ memory, toolContext }) {
     if (names.length) {
       return `Near ${place}, good options include ${names.join(", ")}.`;
     }
-    return `I couldn't find nearby results around ${place} with confidence yet.`;
+    return `I couldn’t find solid nearby results around ${place} yet. I can broaden the search or switch to the surrounding city if you want.`;
   }
 
   if (mode === "destination_discovery") {
     const dest = memory?.destination?.label || toolContext?.destinationHint || "your destination";
     const names = (toolContext?.attractionResults || []).slice(0, 4).map((x) => x?.name).filter(Boolean);
     if (names.length) return `Top places in ${dest}: ${names.join(", ")}.`;
-    return `I can help discover top places in ${dest}.`;
+    return `I can help with top places, neighborhoods, and things to do in ${dest}.`;
   }
 
   if (mode === "trip_planning") {
@@ -57,15 +61,36 @@ function fallbackReply({ memory, toolContext }) {
     return "I can show flights using your saved destination and dates. If needed, tell me your origin city.";
   }
 
-  return "I can help with destination discovery, exact place lookup, nearby search, trip planning, or travel actions.";
+  if (mode === "travel_action" && task === "compare_hotels") {
+    return "I can compare hotels once I have the destination and dates.";
+  }
+
+  if (mode === "travel_knowledge") {
+    const subject = memory?.destination?.label || toolContext?.destinationHint || null;
+    const asksEntryRules = /\bvisa|entry|admission|immigration|border|arrival\b/i.test(userQuery);
+    const mentionsNationality = /\bpassport\b|\bi am\b|\bamerican\b|\bcanadian\b|\buk\b|\bindian\b|\baustralian\b/i.test(userQuery);
+    const asksCurrency = /\bcurrency|exchange rate|exchange\b/i.test(userQuery);
+
+    if (asksCurrency && subject) {
+      return `They use the local currency in ${subject}. If you want, I can also help with exchange-rate context.`;
+    }
+    if (asksEntryRules && subject && !mentionsNationality) {
+      return `I can help with ${subject} entry rules. What passport are you traveling on?`;
+    }
+    if (subject) {
+      return `I can help with ${subject} travel questions like visas, entry rules, currency, safety, weather, flights, and hotels.`;
+    }
+  }
+
+  return "I can help with visas, entry rules, places to go, itinerary ideas, flights, and hotels.";
 }
 
 export async function generateChatReply({ messages, threadSummary, memory, toolContext }) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!client) {
     return fallbackReply({ memory, toolContext });
   }
 
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const { chatModel } = getOpenAIModels();
   const summaryText = String(threadSummary || "No summary yet.");
   const memoryText = JSON.stringify(memory || {}, null, 2);
   const toolContextText = JSON.stringify(toolContext || {}, null, 2);
@@ -83,7 +108,8 @@ export async function generateChatReply({ messages, threadSummary, memory, toolC
             "If toolContext lacks evidence, say so briefly and ask one concrete follow-up. " +
             "For exact named place lookup, prioritize the resolved place and exact-matching attraction results. " +
             "If user asks what is near a named place, only discuss nearby results grounded in toolContext. " +
-            "Keep replies concise, useful, and action-oriented.",
+            "Keep replies concise, useful, action-oriented, and plain text. " +
+            "Do not use markdown, bold markers, headings, or code formatting.",
         },
       ],
     },
@@ -120,16 +146,19 @@ export async function generateChatReply({ messages, threadSummary, memory, toolC
     })),
   ];
 
-  const resp = await client.responses.create({
-    model,
-    input,
-    max_output_tokens: 700,
-  });
+  try {
+    const resp = await client.responses.create({
+      model: chatModel,
+      input,
+      max_output_tokens: 700,
+    });
 
-  const text = extractOutputText(resp);
-  if (!text) {
-    throw new Error("Assistant returned empty output");
+    const text = extractOutputText(resp);
+    if (!text) {
+      return fallbackReply({ memory, toolContext });
+    }
+    return text;
+  } catch {
+    return fallbackReply({ memory, toolContext });
   }
-
-  return text;
 }

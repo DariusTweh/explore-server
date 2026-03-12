@@ -13,8 +13,10 @@ import { exploreRoutes } from "./routes/explore.js";
 import { flightsBookingRoutes } from "./routes/flightsBooking.js";
 import { chatsRoutes } from "./routes/chats.js";
 import { savedRoutes } from "./routes/saved.js";
+import { getOpenAIModels } from "./utils/openaiModels.js";
 
 const app = Fastify({ logger: true });
+const openAIModels = getOpenAIModels();
 
 await app.register(cors, { origin: true });
 
@@ -31,6 +33,17 @@ await app.register(assistantRoutes, { prefix: "/api/assistant" });
 await app.register(chatsRoutes, { prefix: "/api/chats" });
 await app.register(savedRoutes, { prefix: "/api/saved" });
 app.get("/ping", async () => "pong");
+
+app.log.info(
+  {
+    openai_models: {
+      chat: openAIModels.chatModel,
+      router: openAIModels.routerModel,
+      summary: openAIModels.summaryModel,
+    },
+  },
+  "resolved OpenAI models"
+);
 
 const port = Number(process.env.PORT || 8787);
 const host = "0.0.0.0";

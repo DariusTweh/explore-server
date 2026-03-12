@@ -463,8 +463,12 @@ export function extractDestinationFromMessage(message, classification = null) {
   const patterns = [
     /\b(?:trip to|visit|visiting|going to|plan me(?: a| an)?|plan)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bbest places in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bbest neighborhoods in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b(?:actually|instead)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b([A-Za-z][A-Za-z\s'-]{2,50})\s+trip\b/i,
+    /\b(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bdo i need a visa for\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bwhat currency do they use in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -549,6 +553,7 @@ export function extractVibesFromMessage(message) {
 export function extractActivePlaceFromMessage(message, classification = null) {
   const text = clean(message);
   if (!text) return null;
+  if (!["place_lookup", "nearby_search"].includes(classification?.mode || "")) return null;
 
   const patterns = [
     /\bwhat about\s+(.+)/i,
@@ -651,50 +656,134 @@ function stableNumber(value) {
   return Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
-function applyResolvedContext(next, resolvedContext) {
-  if (!resolvedContext || typeof resolvedContext !== "object") return next;
-  if (resolvedContext.origin) next.origin = { ...next.origin, ...resolvedContext.origin };
-  if (resolvedContext.destination) next.destination = { ...next.destination, ...resolvedContext.destination };
-  if (resolvedContext.currency) next.currency = { ...next.currency, ...resolvedContext.currency };
-  if (resolvedContext.dates) next.dates = mergeDates(next.dates, resolvedContext.dates);
-  if (resolvedContext.travelers) next.travelers = { ...next.travelers, ...resolvedContext.travelers };
-  if (resolvedContext.budget) next.budget = mergeBudget(next.budget, resolvedContext.budget);
-  if (Array.isArray(resolvedContext.vibe)) {
-    next.vibe = dedupeList([...(next.vibe || []), ...resolvedContext.vibe.map((item) => lower(item))]);
+function getDurableFieldOwners(mode, task) {
+  const owners = new Set();
+  if (mode === "trip_planning") {
+    owners.add("destination");
+    owners.add("dates");
+    owners.add("travelers");
+    owners.add("budget");
+    owners.add("vibe");
+    owners.add("planning_stage");
   }
-  if (resolvedContext.active_place) next.active_place = { ...next.active_place, ...resolvedContext.active_place };
-  return next;
+  if (mode === "travel_action") {
+    owners.add("origin");
+    owners.add("destination");
+    owners.add("dates");
+    if (task === "save_place") owners.add("active_place");
+  }
+  if (mode === "destination_discovery") {
+    owners.add("destination");
+    owners.add("vibe");
+  }
+  if (mode === "travel_knowledge") {
+    owners.add("destination");
+    owners.add("currency");
+  }
+  return owners;
 }
 
-function applyExtractions(next, message, classification = null) {
+function hasStrongConfidence(candidate, threshold = 0.84) {
+  return Number(candidate?.confidence || 0) >= threshold;
+}
+
+function hasExplicitDestinationSignal(message) {
+  return /\b(trip to|visit|going to|best places in|best neighborhoods in|visa|entry|admission|immigration|border|currency)\b/i.test(
+    String(message || "")
+  );
+}
+
+function collectSignals(message, classification = null) {
   const route = extractRouteFromMessage(message);
-  if (route?.origin) next.origin = route.origin;
-  if (route?.destination) next.destination = route.destination;
-
   const destination = extractDestinationFromMessage(message, classification);
-  if (destination) next.destination = destination;
-
   const dates = extractDatesFromMessage(message);
-  if (dates) next.dates = mergeDates(next.dates, dates);
-
   const travelers = extractTravelerInfoFromMessage(message);
-  if (travelers) next.travelers = travelers;
-
   const budget = extractBudgetFromMessage(message);
-  if (budget) next.budget = mergeBudget(next.budget, budget);
-
   const vibe = extractVibesFromMessage(message);
-  if (vibe.length) next.vibe = dedupeList([...(next.vibe || []), ...vibe]);
-
   const activePlace = extractActivePlaceFromMessage(message, classification);
-  if (activePlace) next.active_place = activePlace;
-
   const currencyExplicit = String(message || "").match(/\b(usd|eur|thb|idr|jpy|xof)\b/i);
-  if (currencyExplicit) {
-    next.currency = { code: currencyExplicit[1].toUpperCase(), label: null, confidence: 0.86 };
+  return {
+    route,
+    destination,
+    dates,
+    travelers,
+    budget,
+    vibe,
+    activePlace,
+    currency: currencyExplicit
+      ? { code: currencyExplicit[1].toUpperCase(), label: null, confidence: 0.86 }
+      : null,
+  };
+}
+
+function applySignals(next, signals, { classification, source, message }) {
+  const durableOwners = getDurableFieldOwners(classification?.mode, classification?.task);
+  const allowBackfill = source === "recent";
+  const allowExplicitKnowledgeDestination =
+    classification?.mode === "travel_knowledge" && hasExplicitDestinationSignal(message);
+  const allowStrongResolvedDestination =
+    (classification?.mode === "place_lookup" || classification?.mode === "nearby_search") &&
+    source === "resolved";
+
+  if (durableOwners.has("origin") && signals?.route?.origin && hasStrongConfidence(signals.route.origin, 0.84)) {
+    next.origin = signals.route.origin;
   }
 
-  return next;
+  const destinationCandidate = signals?.route?.destination || signals?.destination || null;
+  if (destinationCandidate) {
+    const canWriteDestination =
+      durableOwners.has("destination") ||
+      allowExplicitKnowledgeDestination ||
+      (allowStrongResolvedDestination && hasStrongConfidence(destinationCandidate, 0.9));
+    if (canWriteDestination && hasStrongConfidence(destinationCandidate, allowStrongResolvedDestination ? 0.9 : 0.84)) {
+      next.destination = destinationCandidate;
+    } else if (allowBackfill && !next.destination && hasStrongConfidence(destinationCandidate, 0.9)) {
+      next.destination = destinationCandidate;
+    }
+  }
+
+  if ((durableOwners.has("dates") || (allowBackfill && !next.dates)) && signals?.dates && hasStrongConfidence(signals.dates, 0.8)) {
+    next.dates = mergeDates(next.dates, signals.dates);
+  }
+
+  if ((durableOwners.has("travelers") || (allowBackfill && !next.travelers)) && signals?.travelers && hasStrongConfidence(signals.travelers, 0.8)) {
+    next.travelers = signals.travelers;
+  }
+
+  if ((durableOwners.has("budget") || (allowBackfill && !next.budget)) && signals?.budget && hasStrongConfidence(signals.budget, 0.8)) {
+    next.budget = mergeBudget(next.budget, signals.budget);
+  }
+
+  if (durableOwners.has("vibe") && Array.isArray(signals?.vibe) && signals.vibe.length) {
+    next.vibe = dedupeList([...(next.vibe || []), ...signals.vibe]);
+  }
+
+  if ((durableOwners.has("currency") || allowExplicitKnowledgeDestination) && signals?.currency) {
+    next.currency = { ...next.currency, ...signals.currency };
+  }
+
+  if ((classification?.mode === "place_lookup" || classification?.mode === "nearby_search") && signals?.activePlace) {
+    next.active_place = signals.activePlace;
+  }
+}
+
+function applyResolvedContext(next, resolvedContext, classification, latestUserMessage) {
+  if (!resolvedContext || typeof resolvedContext !== "object") return next;
+  const signals = {
+    route: { origin: resolvedContext.origin || null, destination: resolvedContext.destination || null },
+    destination: resolvedContext.destination || null,
+    dates: resolvedContext.dates || null,
+    travelers: resolvedContext.travelers || null,
+    budget: resolvedContext.budget || null,
+    vibe: Array.isArray(resolvedContext.vibe) ? resolvedContext.vibe.map((item) => lower(item)) : [],
+    activePlace: resolvedContext.active_place || null,
+    currency: resolvedContext.currency || null,
+  };
+  applySignals(next, signals, {
+    classification,
+    source: "resolved",
+    message: latestUserMessage,
+  });
 }
 
 export function resolveMemoryFromRecentMessages({
@@ -707,11 +796,19 @@ export function resolveMemoryFromRecentMessages({
   const next = normalizeMemory(previousMemory);
   for (const msg of Array.isArray(recentMessages) ? recentMessages : []) {
     if (msg?.role !== "user") continue;
-    applyExtractions(next, msg.content, classification);
+    applySignals(next, collectSignals(msg.content, classification), {
+      classification,
+      source: "recent",
+      message: msg.content,
+    });
   }
 
-  applyResolvedContext(next, resolvedContext);
-  applyExtractions(next, latestUserMessage, classification);
+  applyResolvedContext(next, resolvedContext, classification, latestUserMessage);
+  applySignals(next, collectSignals(latestUserMessage, classification), {
+    classification,
+    source: "latest",
+    message: latestUserMessage,
+  });
 
   if (!next.currency && next.destination) {
     next.currency = inferCurrencyFromDestination(next.destination);
@@ -728,6 +825,9 @@ export function resolveMemoryFromRecentMessages({
   next.last_mode = classification?.mode || next.last_mode || null;
   next.last_task = classification?.task || next.last_task || null;
   next.planning_stage = nextPlanningStage(next.last_mode, next.last_task, next.planning_stage);
+  if (classification?.mode === "destination_discovery" && !next.planning_stage) {
+    next.planning_stage = "discovery";
+  }
   next.open_loops = buildOpenLoops(next);
   return next;
 }

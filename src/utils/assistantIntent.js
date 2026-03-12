@@ -1,7 +1,10 @@
 import OpenAI from "openai";
 import { z } from "zod";
+import { getOpenAIModels } from "./openaiModels.js";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 const MODE_VALUES = [
   "travel_knowledge",
@@ -37,6 +40,16 @@ function clean(text) {
     .trim();
 }
 
+function lower(text) {
+  return clean(text).toLowerCase();
+}
+
+function isLikelyPoi(value) {
+  return /\bmuseum|hotel|restaurant|cafe|station|airport|park|temple|shrine|castle|louvre|tower\b/i.test(
+    clean(value)
+  );
+}
+
 function sanitizeDestinationCandidate(value) {
   const normalized = clean(value)
     .replace(/\btrip\b.*$/i, "")
@@ -47,12 +60,9 @@ function sanitizeDestinationCandidate(value) {
     .replace(/\b(?:next|this)\s+(?:week|month|weekend|spring|summer|winter|fall|autumn)\b.*$/i, "")
     .replace(/[?.!,]$/g, "")
     .trim();
-
   if (!normalized) return null;
-  if (/\bmuseum|hotel|restaurant|cafe|station|airport|park|temple|shrine|castle\b/i.test(normalized)) {
-    return null;
-  }
-  if (normalized.length > 40) return null;
+  if (normalized.length > 50) return null;
+  if (isLikelyPoi(normalized)) return null;
   return normalized;
 }
 
@@ -61,8 +71,13 @@ export function extractDestinationHint(text) {
   const patterns = [
     /\b(?:trip to|visit|visiting|going to|plan me(?: a| an)?|plan)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bbest places in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bbest neighborhoods in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bwhere should i go in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b([A-Za-z][A-Za-z\s'-]{2,50})\s+trip\b/i,
     /\b(?:actually|instead)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\b(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bwhat currency do they use in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bcurrency in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
   ];
   for (const pattern of patterns) {
     const match = source.match(pattern);
@@ -76,6 +91,7 @@ export function extractPlaceSubject(text) {
   const source = clean(text);
   const patterns = [
     /\bwhat about\s+(.+)/i,
+    /\btell me about\s+(.+)/i,
     /\bwhat'?s near\s+(.+)/i,
     /\bwhich are near\s+(.+)/i,
     /\bnear\s+(?:the\s+)?(.+)/i,
@@ -84,160 +100,127 @@ export function extractPlaceSubject(text) {
   for (const pattern of patterns) {
     const match = source.match(pattern);
     const candidate = clean(match?.[1]).replace(/^(?:the)\s+/i, "").replace(/[?.!,]$/, "");
-    if (candidate && candidate.length <= 80) return candidate;
-  }
-  if (/\b(porsche museum|museum|landmark|hotel|restaurant|airport)\b/i.test(source)) {
-    return source.replace(/[?.!,]$/, "");
+    if (candidate && candidate.length <= 80 && isLikelyPoi(candidate)) return candidate;
   }
   return null;
 }
 
 export function looksLikeTripConstraintFollowup(text) {
-  return /\b(make it cheaper|cheaper|more luxury|budget|with my girlfriend|with my boyfriend|with my partner|4 days|5 days|for \d+ days|for \d+ nights|instead|actually)\b/i.test(
+  return /\b(make it cheaper|cheaper|more luxury|budget|with my girlfriend|with my boyfriend|with my partner|4 days|5 days|for \d+ days|for \d+ nights|instead|actually|more nightlife|make it walkable|less touristy)\b/i.test(
     String(text || "")
   );
 }
 
-function fallbackClassification(message, memory = {}) {
-  const raw = clean(message);
-  const text = raw.toLowerCase();
-  const destinationHint = extractDestinationHint(raw) || memory?.destination?.label || null;
-  const placeSubject = extractPlaceSubject(raw);
-  const hasTripContext = Boolean(memory?.destination?.label || memory?.last_mode === "trip_planning");
+function inferLegacyIntent(classification) {
+  if (classification?.mode === "trip_planning") return "trip_plan";
+  if (classification?.mode === "destination_discovery") return "activities";
+  if (classification?.mode === "travel_action") {
+    if (classification?.task === "show_flights") return "flights";
+    if (classification?.task === "compare_hotels") return "hotels";
+  }
+  if (classification?.mode === "place_lookup" || classification?.mode === "nearby_search") {
+    return "spots";
+  }
+  return "chat";
+}
 
-  if (looksLikeTripConstraintFollowup(raw) && hasTripContext) {
-    return {
-      intent: "trip_plan",
-      mode: "trip_planning",
-      task: "build_trip_outline",
-      query: raw,
-      destinationHint,
-      confidence: 0.88,
-      response: null,
-      location: null,
-      nearMe: null,
-      openNow: null,
-      lateNight: null,
-      rank: null,
-      radiusKm: null,
-    };
+function hasPlanningContext(memory = {}) {
+  return Boolean(
+    memory?.last_mode === "trip_planning" ||
+      memory?.planning_stage === "itinerary" ||
+      memory?.destination?.label
+  );
+}
+
+function hasKnowledgeContext(memory = {}) {
+  return Boolean(memory?.last_mode === "travel_knowledge" || memory?.destination?.label);
+}
+
+function extractKnowledgeSubject(text, memory = {}) {
+  const source = clean(text);
+  const explicit = extractDestinationHint(source);
+  if (explicit) return explicit;
+
+  const patterns = [
+    /\b([A-Za-z][A-Za-z\s'-]{2,50})\s+(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\b/i,
+    /\b(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bdo i need a visa for\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bcan i enter\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\b(?:currency|safety|weather)\s+(?:in|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bwhat about\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bfor\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+  ];
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    const candidate = sanitizeDestinationCandidate(match?.[1]);
+    if (candidate) return candidate;
   }
 
-  if (/\b(show flights|flights|flight options|book flight)\b/.test(text) || /\bfrom\s+\w+\s+to\s+\w+\b/.test(text)) {
-    return {
-      intent: "flights",
-      mode: "travel_action",
-      task: "show_flights",
-      query: raw,
-      destinationHint,
-      confidence: 0.84,
-      response: null,
-      location: null,
-      nearMe: null,
-      openNow: null,
-      lateNight: null,
-      rank: null,
-      radiusKm: null,
-    };
+  if (/^what about\b/i.test(source) && memory?.destination?.label) {
+    return memory.destination.label;
   }
+  return null;
+}
 
-  if (/\b(plan|itinerary|outline|schedule)\b/.test(text)) {
-    return {
-      intent: "trip_plan",
-      mode: "trip_planning",
-      task: "build_trip_outline",
-      query: raw,
-      destinationHint,
-      confidence: 0.86,
-      response: null,
-      location: null,
-      nearMe: null,
-      openNow: null,
-      lateNight: null,
-      rank: null,
-      radiusKm: null,
-    };
+function looksLikeActionFollowup(text) {
+  return /\b(next weekend|this weekend|next week|next month|tomorrow|today|tonight|flexible|for \d+ days|for \d+ nights|\d+ days|\d+ nights)\b/i.test(
+    String(text || "")
+  );
+}
+
+function extractDestinationFromRoute(text) {
+  const match = clean(text).match(/\bfrom\s+[A-Za-z][A-Za-z\s'-]{1,40}\s+to\s+([A-Za-z][A-Za-z\s'-]{1,40}|[A-Z]{3})\b/i);
+  return sanitizeDestinationCandidate(match?.[1]);
+}
+
+function isKnowledgeQuestion(text, memory = {}) {
+  const raw = lower(text);
+  if (
+    /\b(visa|entry|admission|immigration|tourist entry|border|arrival)\b/.test(raw) ||
+    /\b(currency|exchange rate|exchange|safety|safe|weather)\b/.test(raw) ||
+    /\bdo i need a visa\b/.test(raw) ||
+    /\bcan i enter\b/.test(raw)
+  ) {
+    return true;
   }
-
-  if ((/\bnear\b|\bnearby\b/.test(text)) && placeSubject) {
-    return {
-      intent: "spots",
-      mode: "nearby_search",
-      task: "find_places_near_named_place",
-      query: placeSubject,
-      destinationHint,
-      confidence: 0.82,
-      response: null,
-      location: null,
-      nearMe: /\bnear me\b/.test(text),
-      openNow: /\bopen now\b/.test(text),
-      lateNight: /\blate night\b/.test(text),
-      rank: /\bclosest\b|\bnearby\b/.test(text) ? "distance" : null,
-      radiusKm: null,
-    };
+  if (/^what about\b/i.test(raw) && hasKnowledgeContext(memory) && !isLikelyPoi(raw.replace(/^what about\s+/i, ""))) {
+    return true;
   }
-
-  if ((/\bwhat about\b|\bmuseum\b|\blandmark\b|\bactual\b/.test(text)) && placeSubject) {
-    return {
-      intent: "spots",
-      mode: "place_lookup",
-      task: "resolve_named_poi",
-      query: placeSubject,
-      destinationHint,
-      confidence: 0.8,
-      response: null,
-      location: null,
-      nearMe: null,
-      openNow: null,
-      lateNight: null,
-      rank: null,
-      radiusKm: null,
-    };
+  if (/you couldn't find it for\b/i.test(raw) && hasKnowledgeContext(memory)) {
+    return true;
   }
+  return false;
+}
 
-  if (/\bbest places\b|\btop places\b|\bthings to do\b/.test(text)) {
-    return {
-      intent: "activities",
-      mode: "destination_discovery",
-      task: "discover_top_places",
-      query: raw,
-      destinationHint,
-      confidence: 0.82,
-      response: null,
-      location: null,
-      nearMe: null,
-      openNow: null,
-      lateNight: null,
-      rank: "popularity",
-      radiusKm: null,
-    };
-  }
+function isActionIntent(text) {
+  const raw = lower(text);
+  return (
+    /\b(show flights|flight options|book flight|compare hotels|show hotels|save this place|save place)\b/.test(raw) ||
+    /\bfrom\s+[a-z]{3,40}\s+to\s+[a-z]{3,40}\b/.test(raw)
+  );
+}
 
-  if (/\b(currency|exchange rate|exchange|usd|eur|thb|jpy|idr|xof)\b/.test(text)) {
-    return {
-      intent: "chat",
-      mode: "travel_knowledge",
-      task: "answer_currency_question",
-      query: raw,
-      destinationHint,
-      confidence: 0.86,
-      response: null,
-      location: null,
-      nearMe: null,
-      openNow: null,
-      lateNight: null,
-      rank: null,
-      radiusKm: null,
-    };
-  }
+function isNearbyIntent(text) {
+  const raw = lower(text);
+  return /\bwhat'?s near\b|\bwhich are near\b|\bnear it\b|\bnearby\b|\bnear me\b/.test(raw);
+}
 
-  return {
-    intent: "chat",
-    mode: hasTripContext && looksLikeTripConstraintFollowup(raw) ? "trip_planning" : "travel_knowledge",
-    task: hasTripContext && looksLikeTripConstraintFollowup(raw) ? "build_trip_outline" : "answer_general_travel_question",
-    query: raw,
-    destinationHint,
-    confidence: 0.64,
+function isPlaceLookupIntent(text) {
+  const raw = clean(text);
+  return Boolean(
+    /^what about\b/i.test(raw) ||
+      /^tell me about\b/i.test(raw) ||
+      (isLikelyPoi(raw) && !/\brequirements?\b/i.test(raw))
+  );
+}
+
+function isDestinationDiscoveryIntent(text) {
+  const raw = lower(text);
+  return /\bbest places in\b|\btop places in\b|\bthings to do in\b|\bbest neighborhoods in\b|\bwhere should i go in\b/.test(raw);
+}
+
+function buildRuleClassification(overrides) {
+  const base = {
     response: null,
     location: null,
     nearMe: null,
@@ -246,61 +229,191 @@ function fallbackClassification(message, memory = {}) {
     rank: null,
     radiusKm: null,
   };
+  const next = { ...base, ...overrides };
+  return {
+    ...next,
+    intent: next.intent || inferLegacyIntent(next),
+  };
 }
 
-function inferLegacyIntent(classification) {
-  const mode = classification?.mode;
-  const task = classification?.task;
-  const query = clean(classification?.query);
-  if (mode === "trip_planning") return "trip_plan";
-  if (mode === "travel_action") {
-    if (task === "show_flights") return "flights";
-    if (task === "compare_hotels") return "hotels";
-    return "chat";
+function determineIntentFromRules(message, memory = {}) {
+  const raw = clean(message);
+  const destinationHint = extractDestinationHint(raw);
+  const placeSubject = extractPlaceSubject(raw);
+
+  if (isActionIntent(raw)) {
+    const hotelLike = /\bhotel|hotels\b/i.test(raw);
+    return buildRuleClassification({
+      intent: hotelLike ? "hotels" : "flights",
+      mode: "travel_action",
+      task: hotelLike ? "compare_hotels" : "show_flights",
+      query: raw,
+      destinationHint: destinationHint || extractDestinationFromRoute(raw) || memory?.destination?.label || null,
+      confidence: 0.94,
+      nearMe: /\bnear me\b/i.test(raw),
+    });
   }
-  if (mode === "destination_discovery") return "activities";
-  if (mode === "place_lookup" || mode === "nearby_search") {
-    if (/\brestaurant|food|dinner|lunch|brunch|eat\b/.test(query)) return "restaurants";
-    return "spots";
+
+  if (isNearbyIntent(raw)) {
+    return buildRuleClassification({
+      mode: "nearby_search",
+      task: "find_places_near_named_place",
+      query: placeSubject || memory?.active_place?.label || raw,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.92,
+      nearMe: /\bnear me\b/i.test(raw),
+      openNow: /\bopen now\b/i.test(raw),
+      lateNight: /\btonight\b|\blate night\b/i.test(raw),
+      rank: /\bclosest\b|\bnearby\b/i.test(raw) ? "distance" : null,
+    });
   }
-  return "chat";
+
+  if (isPlaceLookupIntent(raw) && placeSubject) {
+    return buildRuleClassification({
+      mode: "place_lookup",
+      task: "resolve_named_poi",
+      query: placeSubject,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.9,
+    });
+  }
+
+  if (looksLikeTripConstraintFollowup(raw) && hasPlanningContext(memory)) {
+    return buildRuleClassification({
+      intent: "trip_plan",
+      mode: "trip_planning",
+      task: "build_trip_outline",
+      query: raw,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.9,
+    });
+  }
+
+  if (looksLikeActionFollowup(raw) && memory?.last_mode === "travel_action") {
+    return buildRuleClassification({
+      intent: memory?.last_task === "compare_hotels" ? "hotels" : "flights",
+      mode: "travel_action",
+      task: memory?.last_task === "compare_hotels" ? "compare_hotels" : "show_flights",
+      query: raw,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.82,
+    });
+  }
+
+  if (/\b(plan|itinerary|outline|schedule)\b/i.test(raw)) {
+    return buildRuleClassification({
+      intent: "trip_plan",
+      mode: "trip_planning",
+      task: "build_trip_outline",
+      query: raw,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.9,
+    });
+  }
+
+  if (isDestinationDiscoveryIntent(raw)) {
+    return buildRuleClassification({
+      intent: "activities",
+      mode: "destination_discovery",
+      task: "discover_top_places",
+      query: raw,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.9,
+      rank: "popularity",
+    });
+  }
+
+  if (isKnowledgeQuestion(raw, memory)) {
+    const knowledgeSubject = extractKnowledgeSubject(raw, memory);
+    const currencyLike = /\bcurrency|exchange rate|exchange\b/i.test(raw);
+    return buildRuleClassification({
+      intent: "chat",
+      mode: "travel_knowledge",
+      task: currencyLike ? "answer_currency_question" : "answer_general_travel_question",
+      query: raw,
+      destinationHint: knowledgeSubject || memory?.destination?.label || null,
+      confidence: 0.92,
+    });
+  }
+
+  if (/^what about\b/i.test(raw) && hasPlanningContext(memory)) {
+    const knowledgeSubject = extractKnowledgeSubject(raw, memory);
+    if (knowledgeSubject && !isLikelyPoi(knowledgeSubject)) {
+      return buildRuleClassification({
+        intent: "chat",
+        mode: "travel_knowledge",
+        task: "answer_general_travel_question",
+        query: raw,
+        destinationHint: knowledgeSubject,
+        confidence: 0.76,
+      });
+    }
+  }
+
+  return null;
 }
 
 function postProcessClassification(data, memory, userMessage) {
   const next = { ...data };
-  next.destinationHint = sanitizeDestinationCandidate(next.destinationHint) || extractDestinationHint(userMessage) || memory?.destination?.label || null;
+  next.destinationHint =
+    sanitizeDestinationCandidate(next.destinationHint) ||
+    extractDestinationHint(userMessage) ||
+    extractKnowledgeSubject(userMessage, memory) ||
+    memory?.destination?.label ||
+    null;
+
   if (next.mode === "place_lookup" || next.mode === "nearby_search") {
-    next.query = extractPlaceSubject(next.query || userMessage);
+    next.query = extractPlaceSubject(next.query || userMessage) || clean(next.query || userMessage) || null;
   } else {
     next.query = clean(next.query || userMessage) || null;
   }
-  if (looksLikeTripConstraintFollowup(userMessage) && (memory?.destination?.label || memory?.last_mode === "trip_planning")) {
+
+  if (looksLikeTripConstraintFollowup(userMessage) && hasPlanningContext(memory)) {
     next.mode = "trip_planning";
     next.task = "build_trip_outline";
     next.intent = "trip_plan";
     next.destinationHint = next.destinationHint || memory?.destination?.label || null;
   }
-  return next;
+
+  return {
+    ...next,
+    intent: next.intent || inferLegacyIntent(next),
+  };
 }
 
 export async function classifyAssistantIntent(input = {}) {
   const payload = typeof input === "string" ? { message: input } : input || {};
   const { message, memory } = payload;
   const userMessage = clean(message);
+  const safeMemory = memory || {};
   if (!userMessage) return null;
 
-  if (!process.env.OPENAI_API_KEY) {
-    return fallbackClassification(userMessage, memory || {});
+  const deterministic = determineIntentFromRules(userMessage, safeMemory);
+  if (deterministic) {
+    return postProcessClassification(deterministic, safeMemory, userMessage);
   }
 
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  if (!client) {
+    return postProcessClassification(
+      buildRuleClassification({
+        intent: "chat",
+        mode: "travel_knowledge",
+        task: "answer_general_travel_question",
+        query: userMessage,
+        destinationHint: extractDestinationHint(userMessage) || safeMemory?.destination?.label || null,
+        confidence: 0.55,
+      }),
+      safeMemory,
+      userMessage
+    );
+  }
+
+  const { routerModel } = getOpenAIModels();
   const prompt = `
 You are the intent router for a Trip Operating System assistant.
 Return JSON only.
 
-Classify the user message into exactly one mode and one task.
-
-Modes:
+Use these exact modes only:
 - travel_knowledge
 - destination_discovery
 - place_lookup
@@ -308,23 +421,28 @@ Modes:
 - trip_planning
 - travel_action
 
-Rules:
-- Follow-up constraints like "make it cheaper", "with my girlfriend", "4 days", "actually Japan instead" should stay in trip_planning if prior trip context exists.
-- destinationHint must be destination-level context only, never a POI.
-- query must be concise. Do not return the whole raw message for place lookup if you can isolate the POI.
+Respect this precedence:
+1. action intent
+2. explicit POI / nearby
+3. trip planning follow-up with prior planning context
+4. destination discovery
+5. travel knowledge
+
+Do not classify visa, entry, admission, immigration, border, or currency questions as place lookup.
+Do not return a POI as destinationHint.
 
 User message: ${JSON.stringify(userMessage)}
-Existing memory: ${JSON.stringify(memory || {})}
+Existing memory: ${JSON.stringify(safeMemory)}
 `.trim();
 
   try {
     const resp = await client.responses.create({
-      model,
+      model: routerModel,
       input: prompt,
       text: {
         format: {
           type: "json_schema",
-          name: "assistant_intent_v3",
+          name: "assistant_intent_v4",
           strict: true,
           schema: {
             type: "object",
@@ -355,32 +473,68 @@ Existing memory: ${JSON.stringify(memory || {})}
     });
 
     const outputText = String(resp.output_text || "").trim();
-    if (!outputText) return fallbackClassification(userMessage, memory || {});
+    if (!outputText) {
+      return postProcessClassification(
+        buildRuleClassification({
+          intent: "chat",
+          mode: "travel_knowledge",
+          task: "answer_general_travel_question",
+          query: userMessage,
+          destinationHint: safeMemory?.destination?.label || null,
+          confidence: 0.5,
+        }),
+        safeMemory,
+        userMessage
+      );
+    }
 
     let parsed;
     try {
       parsed = JSON.parse(outputText);
     } catch {
-      return fallbackClassification(userMessage, memory || {});
+      return postProcessClassification(
+        buildRuleClassification({
+          intent: "chat",
+          mode: "travel_knowledge",
+          task: "answer_general_travel_question",
+          query: userMessage,
+          destinationHint: safeMemory?.destination?.label || null,
+          confidence: 0.5,
+        }),
+        safeMemory,
+        userMessage
+      );
     }
 
     const validated = IntentSchema.safeParse(parsed);
-    if (!validated.success) return fallbackClassification(userMessage, memory || {});
+    if (!validated.success) {
+      return postProcessClassification(
+        buildRuleClassification({
+          intent: "chat",
+          mode: "travel_knowledge",
+          task: "answer_general_travel_question",
+          query: userMessage,
+          destinationHint: safeMemory?.destination?.label || null,
+          confidence: 0.5,
+        }),
+        safeMemory,
+        userMessage
+      );
+    }
 
-    const postProcessed = postProcessClassification(
-      {
-        ...validated.data,
-        intent: validated.data.intent || inferLegacyIntent(validated.data),
-      },
-      memory || {},
+    return postProcessClassification(validated.data, safeMemory, userMessage);
+  } catch {
+    return postProcessClassification(
+      buildRuleClassification({
+        intent: "chat",
+        mode: "travel_knowledge",
+        task: "answer_general_travel_question",
+        query: userMessage,
+        destinationHint: safeMemory?.destination?.label || null,
+        confidence: 0.5,
+      }),
+      safeMemory,
       userMessage
     );
-
-    return {
-      ...postProcessed,
-      intent: postProcessed.intent || inferLegacyIntent(postProcessed),
-    };
-  } catch {
-    return fallbackClassification(userMessage, memory || {});
   }
 }

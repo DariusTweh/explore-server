@@ -1,6 +1,9 @@
 import OpenAI from "openai";
+import { getOpenAIModels } from "./openaiModels.js";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 export async function generatePlanOutline({
   promptText,
@@ -11,9 +14,9 @@ export async function generatePlanOutline({
   vibe,
   travelers,
 }) {
-  if (!process.env.OPENAI_API_KEY) return null;
+  if (!client) return null;
 
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const { chatModel } = getOpenAIModels();
   const system = `
 You create short trip outlines for a travel app.
 Return JSON only and follow the schema strictly.
@@ -38,7 +41,7 @@ Make arrival and departure days lighter than full middle days.
   };
 
   const resp = await client.responses.create({
-    model,
+    model: chatModel,
     input: [
       { role: "system", content: system },
       { role: "user", content: JSON.stringify(input) },

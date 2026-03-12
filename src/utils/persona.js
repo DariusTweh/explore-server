@@ -1,7 +1,10 @@
 import OpenAI from "openai";
 import { z } from "zod";
+import { getOpenAIModels } from "./openaiModels.js";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 const PersonaSchema = z.object({
   persona_key: z.string().min(1),
@@ -44,11 +47,15 @@ function extractAnyJsonOrText(resp) {
 }
 
 export async function buildPersonaFromProfile(profile) {
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  if (!client) {
+    throw new Error("Missing OPENAI_API_KEY for persona generation");
+  }
+
+  const { chatModel } = getOpenAIModels();
 
   // LOG WHAT'S GOING IN
   console.log("\n[persona] ===== BUILD PERSONA START =====");
-  console.log("[persona] model:", model);
+  console.log("[persona] model:", chatModel);
   console.log("[persona] profile:", JSON.stringify(profile, null, 2));
 
   const input = `
@@ -78,7 +85,7 @@ ${JSON.stringify(profile, null, 2)}
   console.log("[persona] input length:", input.length);
 
   const resp = await client.responses.create({
-    model,
+    model: chatModel,
     input,
     text: {
       format: {

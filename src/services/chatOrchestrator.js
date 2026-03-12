@@ -11,6 +11,16 @@ function stableString(value) {
   }
 }
 
+function shouldRouteTools(classification) {
+  const mode = classification?.mode || "travel_knowledge";
+  if (mode === "travel_knowledge") return false;
+  if (mode === "trip_planning") return true;
+  if (mode === "travel_action") return true;
+  if (mode === "nearby_search" || mode === "place_lookup") return true;
+  if (mode === "destination_discovery") return true;
+  return false;
+}
+
 export async function runChatOrchestrator({
   threadId,
   userId,
@@ -33,12 +43,24 @@ export async function runChatOrchestrator({
       confidence: 0.4,
     };
 
-  const toolRouting = await routeChatTools({
-    classification,
-    memory: initialMemory,
-    latestUserMessage,
-    logger,
-  });
+  const toolRouting = shouldRouteTools(classification)
+    ? await routeChatTools({
+        classification,
+        memory: initialMemory,
+        latestUserMessage,
+        logger,
+      })
+    : {
+        toolContext: {
+          mode: classification.mode,
+          task: classification.task,
+          destinationHint: classification.destinationHint || initialMemory?.destination?.label || null,
+          userQuery: classification.query || latestUserMessage || null,
+          fallbackNotes: [],
+        },
+        cards: [],
+        resolvedContext: {},
+      };
 
   const refinedUpdate = updateThreadMemory({
     previousMemory: initialMemory,

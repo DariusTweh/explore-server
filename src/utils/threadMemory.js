@@ -164,7 +164,7 @@ function defaultMemory() {
     travelers: null,
     budget: null,
     vibe: [],
-    planning_stage: "discovery",
+    planning_stage: null,
     open_loops: [],
     active_place: null,
     last_mode: null,
@@ -626,12 +626,11 @@ function nextPlanningStage(lastMode, lastTask, previousStage) {
   if (lastMode === "travel_action") return "booking";
   if (lastMode === "destination_discovery") return "discovery";
   if (lastTask === "save_place") return "curation";
-  return previousStage || "discovery";
+  return previousStage || null;
 }
 
 function buildOpenLoops(memory) {
   const loops = [];
-  if (!memory?.destination?.label && memory?.last_mode !== "place_lookup") loops.push("missing_destination");
   if (memory?.last_task === "show_flights") {
     if (!memory?.origin?.label) loops.push("missing_origin");
     if (!memory?.destination?.label) loops.push("missing_destination");
@@ -682,7 +681,6 @@ function getDurableFieldOwners(mode, task) {
     owners.add("vibe");
   }
   if (mode === "travel_knowledge") {
-    owners.add("destination");
     owners.add("currency");
   }
   return owners;
@@ -693,7 +691,7 @@ function hasStrongConfidence(candidate, threshold = 0.84) {
 }
 
 function hasExplicitDestinationSignal(message) {
-  return /\b(trip to|visit|going to|best places in|best neighborhoods in|visa|entry|admission|immigration|border|currency)\b/i.test(
+  return /\b(trip to|visit|going to|i want to go to|i want to visit|best places in|best neighborhoods in|where should i stay in|where to stay in|is [a-z].+ expensive|visa|entry|admission|immigration|border|currency|cruise to|passport for)\b/i.test(
     String(message || "")
   );
 }
@@ -851,7 +849,10 @@ export function resolveMemoryFromRecentMessages({
 
   next.last_mode = classification?.mode || next.last_mode || null;
   next.last_task = classification?.task || next.last_task || null;
-  next.planning_stage = nextPlanningStage(next.last_mode, next.last_task, next.planning_stage);
+  next.planning_stage =
+    classification?.mode === "travel_knowledge"
+      ? next.planning_stage
+      : nextPlanningStage(next.last_mode, next.last_task, next.planning_stage);
   if (classification?.mode === "destination_discovery" && !next.planning_stage) {
     next.planning_stage = "discovery";
   }
@@ -914,7 +915,7 @@ export function shouldRefreshSummary({ messageCount, majorChanged, existingSumma
 export function buildThreadSummary(memory) {
   const m = normalizeMemory(memory);
   const parts = [];
-  parts.push(`Destination: ${m.destination?.label || "unknown"}.`);
+  if (m.destination?.label) parts.push(`Destination: ${m.destination.label}.`);
   if (m.origin?.label) parts.push(`Origin: ${m.origin.label}.`);
 
   const shape = [];

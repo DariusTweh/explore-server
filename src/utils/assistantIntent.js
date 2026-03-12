@@ -71,9 +71,14 @@ export function extractDestinationHint(text) {
   const source = clean(text);
   const patterns = [
     /\b(?:trip to|visit|visiting|going to|plan me(?: a| an)?|plan)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bi want to go to\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bi want to visit\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bbest places in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bbest neighborhoods in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\bwhere should i go in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bwhere should i stay in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bwhere to stay in\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
+    /\bis\s+([A-Za-z][A-Za-z\s'-]{2,50})\s+expensive\b/i,
     /\b([A-Za-z][A-Za-z\s'-]{2,50})\s+trip\b/i,
     /\b(?:actually|instead)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
     /\b(?:visa|entry|admission|immigration|border|arrival)\s+requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50})\b/i,
@@ -129,7 +134,11 @@ function hasPlanningContext(memory = {}) {
   return Boolean(
     memory?.last_mode === "trip_planning" ||
       memory?.planning_stage === "itinerary" ||
-      memory?.destination?.label
+      memory?.dates?.start_date ||
+      memory?.dates?.duration_days ||
+      memory?.travelers?.count ||
+      memory?.budget?.level ||
+      memory?.budget?.amount != null
   );
 }
 
@@ -144,6 +153,7 @@ function extractKnowledgeSubject(text, memory = {}) {
 
   const patterns = [
     /\bcruise\s+to\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
+    /\bcruise\s+from\s+[A-Za-z][A-Za-z\s'-]{2,50}\s+to\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
     /\bpassport requirements?\s+(?:to|for)\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
     /\bdo i need a passport for\s+([A-Za-z][A-Za-z\s'-]{2,50}?)(?=\s+(?:do i need|need|passport)\b|[?.!,]|$)/i,
     /\bfrom\s+([A-Za-z][A-Za-z\s'-]{1,40}|[A-Z]{2,3})\s+to\s+([A-Za-z][A-Za-z\s'-]{2,50}|[A-Z]{3})\b/i,
@@ -214,14 +224,40 @@ function looksLikeFlightKnowledgeQuestion(text) {
   );
 }
 
-function looksLikePassportRequirementQuestion(text) {
+function looksLikePassportQuestion(text) {
   return /\b(passport requirements?|do i need a passport|need a passport)\b/i.test(
     String(text || "")
   );
 }
 
-function looksLikeGeneralTravelDocsQuestion(text) {
-  return /\b(visa|entry|admission|immigration|tourist entry|border|arrival|passport)\b/i.test(
+function looksLikeCruiseDocsQuestion(text) {
+  return /\bcruise\b/i.test(String(text || "")) && looksLikePassportQuestion(text);
+}
+
+function looksLikeVisaEntryQuestion(text) {
+  return /\b(visa|entry|admission|immigration|tourist entry|border|arrival)\b/i.test(
+    String(text || "")
+  );
+}
+
+function looksLikeDestinationAdviceQuestion(text) {
+  return /\b(best places in|top places in|things to do in|best neighborhoods in|where should i go in|is .+ expensive|is [A-Za-z].+ safe|safety in|weather in)\b/i.test(
+    String(text || "")
+  );
+}
+
+function looksLikeWhereToStayQuestion(text) {
+  return /\b(where should i stay|where to stay|best area to stay|best neighborhood to stay|what area should i stay)\b/i.test(
+    String(text || "")
+  );
+}
+
+function looksLikeBudgetExpectationQuestion(text) {
+  return /\b(is .+ expensive|how expensive is|cost of travel in|budget for)\b/i.test(String(text || ""));
+}
+
+function looksLikeExplicitPlanningIntent(text) {
+  return /\b(plan me\b|itinerary|trip plan|build .*trip|i want to go to|i want to visit|5 day|4 day|for \d+ days|for \d+ nights|make it cheaper|add nightlife|make it walkable)\b/i.test(
     String(text || "")
   );
 }
@@ -324,6 +360,17 @@ function determineIntentFromRules(message, memory = {}) {
     });
   }
 
+  if (looksLikeWhereToStayQuestion(raw) && hasPlanningContext(memory)) {
+    return buildRuleClassification({
+      intent: "trip_plan",
+      mode: "trip_planning",
+      task: "choose_where_to_stay",
+      query: raw,
+      destinationHint: destinationHint || memory?.destination?.label || null,
+      confidence: 0.88,
+    });
+  }
+
   if (looksLikeActionFollowup(raw) && memory?.last_mode === "travel_action") {
     return buildRuleClassification({
       intent: memory?.last_task === "compare_hotels" ? "hotels" : "flights",
@@ -335,7 +382,7 @@ function determineIntentFromRules(message, memory = {}) {
     });
   }
 
-  if (/\b(plan|itinerary|outline|schedule)\b/i.test(raw)) {
+  if (looksLikeExplicitPlanningIntent(raw) || /\b(plan|itinerary|outline|schedule)\b/i.test(raw)) {
     return buildRuleClassification({
       intent: "trip_plan",
       mode: "trip_planning",
@@ -346,15 +393,38 @@ function determineIntentFromRules(message, memory = {}) {
     });
   }
 
+  if (looksLikeWhereToStayQuestion(raw)) {
+    return buildRuleClassification({
+      intent: "chat",
+      mode: "travel_knowledge",
+      task: "answer_where_to_stay_question",
+      query: raw,
+      destinationHint: destinationHint || extractKnowledgeSubject(raw, memory) || null,
+      confidence: 0.92,
+    });
+  }
+
+  if (looksLikeDestinationAdviceQuestion(raw)) {
+    return buildRuleClassification({
+      intent: "chat",
+      mode: "travel_knowledge",
+      task: looksLikeBudgetExpectationQuestion(raw)
+        ? "answer_budget_expectation_question"
+        : "answer_destination_advice_question",
+      query: raw,
+      destinationHint: destinationHint || extractKnowledgeSubject(raw, memory) || null,
+      confidence: 0.92,
+    });
+  }
+
   if (isDestinationDiscoveryIntent(raw)) {
     return buildRuleClassification({
-      intent: "activities",
-      mode: "destination_discovery",
-      task: "discover_top_places",
+      intent: "chat",
+      mode: "travel_knowledge",
+      task: "answer_destination_advice_question",
       query: raw,
-      destinationHint: destinationHint || memory?.destination?.label || null,
+      destinationHint: destinationHint || extractKnowledgeSubject(raw, memory) || null,
       confidence: 0.9,
-      rank: "popularity",
     });
   }
 
@@ -370,8 +440,10 @@ function determineIntentFromRules(message, memory = {}) {
           ? "answer_currency_question"
           : flightKnowledgeLike
             ? "answer_flight_time_question"
-            : looksLikePassportRequirementQuestion(raw) || looksLikeGeneralTravelDocsQuestion(raw)
+            : looksLikeCruiseDocsQuestion(raw) || looksLikePassportQuestion(raw) || looksLikeVisaEntryQuestion(raw)
               ? "answer_travel_docs_question"
+              : looksLikeBudgetExpectationQuestion(raw)
+                ? "answer_budget_expectation_question"
               : "answer_general_travel_question",
       query: raw,
       destinationHint: knowledgeSubject || null,
